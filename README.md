@@ -18,7 +18,7 @@ This architecture allows a local mining pool backend situated behind a NAT or fi
 graph TD
     Miner[Miners] -->|Connects to VPS:33333| Server[Go Stratum Proxy Server on VPS]
     
-    subgraph Local Backend Network (Behind NAT)
+    subgraph local_network ["Local Backend Network (Behind NAT)"]
         AgentA[Tunnel Agent A - Priority 1] -->|Outbound dials VPS:44444| Server
         AgentA -->|Dials local pool| PoolA[Local Pool NENG :32221]
         
@@ -26,7 +26,7 @@ graph TD
         AgentB -->|Dials backup pool| PoolB[Local Backup Pool :32222]
     end
 
-    subgraph VPS Server Routing
+    subgraph vps_routing ["VPS Server Routing"]
         Server -->|Selects Priority 1 Tunnel| TunnelPool[Active Tunnel Pool]
         TunnelPool -->|Pipes stream| Miner
     end

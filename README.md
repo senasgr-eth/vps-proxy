@@ -124,17 +124,28 @@ Verifies proxy routing, priority-routing, dynamic agent reconnects, failovers, a
 /usr/local/go/bin/go test -v ./...
 ```
 
-### Compile Server Binary (for VPS)
-```bash
-env GOOS=linux GOARCH=amd64 /usr/local/go/bin/go build -ldflags="-s -w" -o stratum-proxy main.go
-```
+### Building Binaries
+For simplicity, you can use the helper script `./build.sh` to compile your binaries:
 
-### Compile Agent Binary (for Local Backend)
-```bash
-env GOOS=linux GOARCH=amd64 /usr/local/go/bin/go build -ldflags="-s -w" -o stratum-agent agent/main.go
-```
+1. **Build for your current system**:
+   ```bash
+   ./build.sh
+   # Binaries will be built in: build/bin/
+   ```
+
+2. **Cross-compile for all targets (Linux AMD64 and ARM64)**:
+   ```bash
+   ./build.sh all
+   # Binaries will be built in: build/linux-amd64/ and build/linux-arm64/
+   ```
+
+3. **Clean up build artifacts**:
+   ```bash
+   ./build.sh clean
+   ```
 
 ---
+
 
 ## Deployment
 

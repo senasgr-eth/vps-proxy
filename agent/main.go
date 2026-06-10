@@ -65,6 +65,11 @@ func main() {
 		wg.Add(1)
 		go func(mapping Mapping) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[PANIC RECOVERY] Pool manager for group %s panicked: %v", mapping.Group, r)
+				}
+			}()
 			maintainTunnelPool(cfg, mapping)
 		}(m)
 	}
@@ -87,6 +92,11 @@ func maintainTunnelPool(cfg Config, mapping Mapping) {
 		go func() {
 			defer func() {
 				slots <- struct{}{} // Release slot on exit
+			}()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[PANIC RECOVERY] Tunnel session for group %s panicked: %v", mapping.Group, r)
+				}
 			}()
 
 			runTunnelSession(cfg, mapping)
@@ -177,6 +187,11 @@ func runTunnelSession(cfg Config, mapping Mapping) {
 
 	// VPS -> Local Pool
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[PANIC RECOVERY] Tunnel piping from VPS to local pool panicked: %v", r)
+			}
+		}()
 		_, _ = io.Copy(localConn, vpsConn)
 		_ = localConn.Close()
 		_ = vpsConn.Close()

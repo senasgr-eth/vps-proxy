@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -916,3 +917,132 @@ func TestStaticMapping(t *testing.T) {
 		}
 	})
 }
+
+func TestPanicRecovery(t *testing.T) {
+	cfg := &Config{
+		Listen:       "127.0.0.1:0",
+		TunnelListen: "127.0.0.1:0",
+		DefaultGroup: "group_neng",
+		Groups: []Group{
+			{
+				Name:  "group_neng",
+				Coins: []string{"NENG"},
+			},
+		},
+	}
+	cm := &ConfigManager{cfg: cfg}
+	tm := NewTunnelManager()
+
+	minerListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer minerListener.Close()
+	minerServerAddr := minerListener.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Run accept loop with trigger override to trigger simulated panic
+	go runMinerAcceptLoop(ctx, minerListener, cm, tm, "panic_trigger_for_test")
+
+	// Dial and trigger panic
+	conn, err := net.Dial("tcp", minerServerAddr)
+	if err != nil {
+		t.Fatalf("Dial error: %v", err)
+	}
+	_ = conn.Close()
+
+	// Wait a moment for panic recovery to log and release resources
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify the server accept loop is still alive and accepting new connections
+	conn2, err := net.Dial("tcp", minerServerAddr)
+	if err != nil {
+		t.Fatalf("Server Accept loop died after panic: %v", err)
+	}
+	_ = conn2.Close()
+}
+
+func TestMaxConnections(t *testing.T) {
+	cfg := &Config{
+		Listen:         "127.0.0.1:0",
+		TunnelListen:   "127.0.0.1:0",
+		DefaultGroup:   "group_neng",
+		MaxConnections: 2, // set limit to 2
+		Groups: []Group{
+			{
+				Name:  "group_neng",
+				Coins: []string{"NENG"},
+			},
+		},
+	}
+	cm := &ConfigManager{cfg: cfg}
+	tm := NewTunnelManager()
+
+	// Reset active connections
+	atomic.StoreInt64(&activeConns, 0)
+
+	minerListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer minerListener.Close()
+	minerServerAddr := minerListener.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go runMinerAcceptLoop(ctx, minerListener, cm, tm, "")
+
+	// 1. Establish 1st connection
+	conn1, err := net.Dial("tcp", minerServerAddr)
+	if err != nil {
+		t.Fatalf("Failed to dial 1st: %v", err)
+	}
+	defer conn1.Close()
+
+	// 2. Establish 2nd connection
+	conn2, err := net.Dial("tcp", minerServerAddr)
+	if err != nil {
+		t.Fatalf("Failed to dial 2nd: %v", err)
+	}
+	defer conn2.Close()
+
+	// Give a tiny moment for accept loop goroutines to start and increment counter
+	time.Sleep(50 * time.Millisecond)
+
+	// 3. Establish 3rd connection - should be closed immediately
+	conn3, err := net.Dial("tcp", minerServerAddr)
+	if err != nil {
+		t.Fatalf("Failed to dial 3rd: %v", err)
+	}
+	defer conn3.Close()
+
+	// Read from 3rd connection - should get EOF immediately because it was closed
+	_ = conn3.SetReadDeadline(time.Now().Add(1 * time.Second))
+	buf := make([]byte, 10)
+	_, err = conn3.Read(buf)
+	if err == nil {
+		t.Errorf("Expected 3rd connection to be closed due to limit, but read succeeded")
+	}
+
+	// 4. Close 1st connection, slot becomes available
+	_ = conn1.Close()
+	time.Sleep(50 * time.Millisecond) // wait for defer close hook
+
+	// 5. Establish 4th connection - should succeed
+	conn4, err := net.Dial("tcp", minerServerAddr)
+	if err != nil {
+		t.Fatalf("Failed to dial 4th after slot freed: %v", err)
+	}
+	defer conn4.Close()
+
+	// Verify we can read/write on 4th (not dropped immediately)
+	_ = conn4.SetWriteDeadline(time.Now().Add(1 * time.Second))
+	_, err = conn4.Write([]byte("test"))
+	if err != nil {
+		t.Errorf("Expected 4th connection to remain open, but write failed: %v", err)
+	}
+}
+

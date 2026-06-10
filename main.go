@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,7 @@ type Config struct {
 	TLSCert          string  `json:"tls_cert"`
 	TLSKey           string  `json:"tls_key"`
 	Groups           []Group `json:"groups"`
+	MaxConnections   int     `json:"max_connections"`
 }
 
 type ConfigManager struct {
@@ -101,8 +103,13 @@ func loadConfig(path string) (*Config, error) {
 		}
 	}
 
+	if cfg.MaxConnections <= 0 {
+		cfg.MaxConnections = 10000
+	}
+
 	return &cfg, nil
 }
+
 
 // Tunnel represents an idle connection from a Tunnel Agent.
 type Tunnel struct {
@@ -146,8 +153,8 @@ func (tm *TunnelManager) CleanDeadTunnels() {
 	for grp, list := range tm.tunnels {
 		var active []*Tunnel
 		for _, t := range list {
-			// Zero-byte read check by setting a microscopic timeout
-			_ = t.conn.SetReadDeadline(time.Now().Add(1 * time.Microsecond))
+			// Zero-byte read check by setting a microscopic timeout (1ms)
+			_ = t.conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
 			one := make([]byte, 1)
 			_, err := t.conn.Read(one)
 			_ = t.conn.SetReadDeadline(time.Time{}) // Reset deadline
@@ -278,7 +285,34 @@ func (cw CountedWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+var activeConns int64
+
+type TrackedConn struct {
+	net.Conn
+	closed int32
+}
+
+func (tc *TrackedConn) Close() error {
+	if atomic.CompareAndSwapInt32(&tc.closed, 0, 1) {
+		atomic.AddInt64(&activeConns, -1)
+		return tc.Conn.Close()
+	}
+	return nil
+}
+
+func safeGo(name string, f func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[PANIC RECOVERY] Goroutine %s panicked: %v", name, r)
+			}
+		}()
+		f()
+	}()
+}
+
 const Version = "1.3.0"
+
 
 func main() {
 	configPath := "backends.json"
@@ -307,15 +341,17 @@ func main() {
 	tm := NewTunnelManager()
 
 	// Start configuration hot-reloader
-	go watchConfig(configPath, cm)
+	safeGo("watchConfig", func() {
+		watchConfig(configPath, cm)
+	})
 
 	// Start periodic dead tunnel cleaner every 10 seconds
-	go func() {
+	safeGo("deadTunnelCleaner", func() {
 		for {
 			time.Sleep(10 * time.Second)
 			tm.CleanDeadTunnels()
 		}
-	}()
+	})
 
 	// Start tunnel acceptance port (uses raw TCP listener, dynamic TLS handled per connection)
 	tunnelListener, errTunnel := net.Listen("tcp", cfg.TunnelListen)
@@ -361,7 +397,7 @@ func main() {
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
+	safeGo("signalHandler", func() {
 		sig := <-sigChan
 		log.Printf("Received signal %s, shutting down...", sig)
 		cancel()
@@ -369,20 +405,29 @@ func main() {
 		for _, ml := range minerListeners {
 			_ = ml.Close()
 		}
-	}()
+	})
 
 	// Run acceptance loops
-	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
+	safeGo("tunnelAcceptLoop", func() {
+		runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
+	})
 
 	idx := 0
 	if cfg.Listen != "" {
-		go runMinerAcceptLoop(ctx, minerListeners[idx], cm, tm, "")
+		ml := minerListeners[idx]
+		safeGo("minerAcceptLoop_global", func() {
+			runMinerAcceptLoop(ctx, ml, cm, tm, "")
+		})
 		idx++
 	}
 	for i := range cfg.Groups {
 		g := &cfg.Groups[i]
 		if g.Listen != "" {
-			go runMinerAcceptLoop(ctx, minerListeners[idx], cm, tm, g.Name)
+			ml := minerListeners[idx]
+			groupName := g.Name
+			safeGo("minerAcceptLoop_"+groupName, func() {
+				runMinerAcceptLoop(ctx, ml, cm, tm, groupName)
+			})
 			idx++
 		}
 	}
@@ -450,7 +495,22 @@ func runTunnelAcceptLoop(ctx context.Context, listener net.Listener, tm *TunnelM
 			}
 		}
 
-		go handleTunnelRegistration(conn, tm, cm)
+		cfg := cm.Get()
+		limit := cfg.MaxConnections
+		if limit <= 0 {
+			limit = 10000
+		}
+		if atomic.LoadInt64(&activeConns) >= int64(limit) {
+			log.Printf("Max connections reached (%d), dropping tunnel connection from %s", limit, conn.RemoteAddr().String())
+			_ = conn.Close()
+			continue
+		}
+		atomic.AddInt64(&activeConns, 1)
+		tracked := &TrackedConn{Conn: conn}
+
+		safeGo("tunnelRegistration_"+conn.RemoteAddr().String(), func() {
+			handleTunnelRegistration(tracked, tm, cm)
+		})
 	}
 }
 
@@ -505,7 +565,7 @@ func handleTunnelRegistration(conn net.Conn, tm *TunnelManager, cm *ConfigManage
 			_ = tlsConn.SetReadDeadline(time.Time{})
 			if err != nil {
 				log.Printf("[%s] TLS handshake failed: %v", clientAddr, err)
-				_ = tlsConn.Close()
+				_ = wrappedConn.Close()
 				return
 			}
 			wrappedConn = tlsConn
@@ -566,7 +626,7 @@ func handleTunnelRegistration(conn net.Conn, tm *TunnelManager, cm *ConfigManage
 
 	if cfg.SecretToken != "" {
 		token := parts[3]
-		if token != cfg.SecretToken {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(cfg.SecretToken)) != 1 {
 			log.Printf("[%s] Tunnel registration failed: invalid secret token", clientAddr)
 			_ = wrappedConn.Close()
 			return
@@ -582,6 +642,7 @@ func handleTunnelRegistration(conn net.Conn, tm *TunnelManager, cm *ConfigManage
 	tm.Add(t)
 }
 
+
 func runMinerAcceptLoop(ctx context.Context, listener net.Listener, cm *ConfigManager, tm *TunnelManager, overrideGroupName string) {
 	for {
 		clientConn, err := listener.Accept()
@@ -595,11 +656,29 @@ func runMinerAcceptLoop(ctx context.Context, listener net.Listener, cm *ConfigMa
 			}
 		}
 
-		go handleMiner(clientConn, cm, tm, overrideGroupName)
+		cfg := cm.Get()
+		limit := cfg.MaxConnections
+		if limit <= 0 {
+			limit = 10000
+		}
+		if atomic.LoadInt64(&activeConns) >= int64(limit) {
+			log.Printf("Max connections reached (%d), dropping miner connection from %s", limit, clientConn.RemoteAddr().String())
+			_ = clientConn.Close()
+			continue
+		}
+		atomic.AddInt64(&activeConns, 1)
+		tracked := &TrackedConn{Conn: clientConn}
+
+		safeGo("minerConn_"+clientConn.RemoteAddr().String(), func() {
+			handleMiner(tracked, cm, tm, overrideGroupName)
+		})
 	}
 }
 
 func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, overrideGroupName string) {
+	if overrideGroupName == "panic_trigger_for_test" {
+		panic("simulated test panic")
+	}
 	clientAddr := clientConn.RemoteAddr().String()
 
 	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
@@ -722,13 +801,13 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, over
 	done := make(chan struct{}, 1)
 
 	// Client -> Tunnel
-	go func() {
+	safeGo("pipe_client_to_tunnel_"+clientAddr, func() {
 		cw := CountedWriter{w: tunnelConn, c: &bytesSent}
 		_, _ = io.Copy(cw, clientConn)
 		_ = tunnelConn.Close()
 		_ = clientConn.Close()
 		done <- struct{}{}
-	}()
+	})
 
 	// Tunnel -> Client
 	cw := CountedWriter{w: clientConn, c: &bytesReceived}

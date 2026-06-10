@@ -9,6 +9,7 @@ This architecture allows a local mining pool backend situated behind a NAT or fi
 2. **No Dynamic IP Updating Needed**: Since the Agent initiates the connection, the VPS does not need to know the backend's IP. If your local ISP reconnects and changes your dynamic IP, the agent simply reconnects to the VPS automatically.
 3. **Primary-Backup High Availability**: Tunnels register with a priority level (e.g. `1` for primary, `2` for backup). The VPS always routes incoming miner connections to the highest priority idle tunnel available.
 4. **FIFO Connection Allocation**: To ensure stratum stream stability, idle connections are popped in First-In, First-Out (FIFO) order.
+5. **Dedicated Port Mapping (Optional)**: In addition to the universal miner port (which dynamically scans coin symbols), you can open dedicated listen ports per coin group. Connections on these ports map directly to the corresponding group, bypassing payload scanning entirely.
 
 ---
 
@@ -41,7 +42,7 @@ Placed on the VPS. It configures the port for miners, the port for the agents, s
 
 ```json
 {
-  "listen": "0.0.0.0:33333",
+  "listen": "0.0.0.0:33333", // Optional universal port
   "tunnel_listen": "0.0.0.0:44444",
   "default_group": "group_neng",
   "failback_cooldown": "8h",
@@ -52,11 +53,13 @@ Placed on the VPS. It configures the port for miners, the port for the agents, s
     {
       "name": "group_neng",
       "coins": ["NENG", "NXE", "MTBC"],
+      "listen": "0.0.0.0:33334", // Dedicated NENG group port
       "static_mapping": false
     },
     {
       "name": "group_nxe",
       "coins": ["BTG", "BTB", "XXX"],
+      "listen": "0.0.0.0:33335", // Dedicated NXE group port
       "static_mapping": true
     }
   ]

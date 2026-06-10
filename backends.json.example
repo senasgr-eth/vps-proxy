@@ -1,5 +1,5 @@
 {
-  // Port where miners connect (Stratum mining client)
+  // Port where miners connect (Stratum mining client) - OPTIONAL if at least one group has a dedicated listen port
   "listen": "0.0.0.0:33333",
 
   // Port where Tunnel Agents connect from behind the NAT
@@ -25,6 +25,8 @@
     {
       "name": "group_neng",
       "coins": ["NENG", "NXE", "MTBC"],
+      // Optional: Dedicated port for NENG miners. Bypasses coin scanning and maps directly to group_neng.
+      "listen": "0.0.0.0:33334",
       // Set to true to disable automatic failover to backups for this group.
       // Useful if backends support only specific coins and must not receive others.
       "static_mapping": false
@@ -32,6 +34,7 @@
     {
       "name": "group_nxe",
       "coins": ["BTG", "BTB", "XXX"],
+      "listen": "0.0.0.0:33335",
       "static_mapping": true
     }
   ]

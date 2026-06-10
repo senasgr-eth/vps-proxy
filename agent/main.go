@@ -28,6 +28,8 @@ type Config struct {
 	Mappings      []Mapping `json:"mappings"`
 }
 
+const Version = "1.3.0"
+
 func main() {
 	configPath := "agent.json"
 	if len(os.Args) > 1 {
@@ -35,7 +37,7 @@ func main() {
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("Starting Tunnel Stratum Proxy Agent...")
+	log.Printf("Starting Tunnel Stratum Proxy Agent v%s...", Version)
 
 	// Load configuration
 	cfgFile, err := os.Open(configPath)

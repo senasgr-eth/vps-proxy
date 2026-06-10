@@ -243,7 +243,7 @@ func TestRoutingAndFailover(t *testing.T) {
 
 	// Run server loops
 	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
-	go runMinerAcceptLoop(ctx, minerListener, cm, tm)
+	go runMinerAcceptLoop(ctx, minerListener, cm, tm, "")
 
 	// Start Agents
 	agentAContext, cancelAgentA := context.WithCancel(ctx)
@@ -619,7 +619,7 @@ func TestSecurityAuthentication(t *testing.T) {
 	defer cancel()
 
 	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
-	go runMinerAcceptLoop(ctx, minerListener, cm, tm)
+	go runMinerAcceptLoop(ctx, minerListener, cm, tm, "")
 
 	t.Run("Agent registers successfully with correct token and TLS", func(t *testing.T) {
 		agentCtx, cancelAgent := context.WithCancel(ctx)
@@ -696,6 +696,120 @@ func TestSecurityAuthentication(t *testing.T) {
 	})
 }
 
+func TestMultipleMinerPorts(t *testing.T) {
+	dataChan := make(chan string, 10)
+
+	// Start local backend pools
+	_, poolNengAddr, cleanupNeng := startMockPool(t, "pool_neng", dataChan)
+	defer cleanupNeng()
+
+	_, poolNxeAddr, cleanupNxe := startMockPool(t, "pool_nxe", dataChan)
+	defer cleanupNxe()
+
+	// Configure server with dedicated ports for both groups and no global listen
+	cfg := &Config{
+		Listen:       "", // Global port is empty
+		TunnelListen: "127.0.0.1:0",
+		Groups: []Group{
+			{
+				Name:   "group_neng",
+				Coins:  []string{"NENG"},
+				Listen: "127.0.0.1:0", // dedicated port OS-allocated
+			},
+			{
+				Name:   "group_nxe",
+				Coins:  []string{"NXE"},
+				Listen: "127.0.0.1:0", // dedicated port OS-allocated
+			},
+		},
+	}
+
+	cm := &ConfigManager{cfg: cfg}
+	tm := NewTunnelManager()
+
+	tunnelListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen for tunnels: %v", err)
+	}
+	defer tunnelListener.Close()
+	tunnelServerAddr := tunnelListener.Addr().String()
+
+	// Dedicate TCP ports
+	nengMinerListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen for NENG miners: %v", err)
+	}
+	defer nengMinerListener.Close()
+	nengMinerAddr := nengMinerListener.Addr().String()
+
+	nxeMinerListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen for NXE miners: %v", err)
+	}
+	defer nxeMinerListener.Close()
+	nxeMinerAddr := nxeMinerListener.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start accept loops
+	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
+	go runMinerAcceptLoop(ctx, nengMinerListener, cm, tm, "group_neng")
+	go runMinerAcceptLoop(ctx, nxeMinerListener, cm, tm, "group_nxe")
+
+	// Start Agents
+	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_neng", 1, poolNengAddr, 3, "", false)
+	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_nxe", 1, poolNxeAddr, 3, "", false)
+
+	time.Sleep(300 * time.Millisecond) // Wait for agents
+
+	t.Run("Routes to NENG group from dedicated NENG port", func(t *testing.T) {
+		conn, err := net.Dial("tcp", nengMinerAddr)
+		if err != nil {
+			t.Fatalf("Dial NENG miner port error: %v", err)
+		}
+		defer conn.Close()
+
+		// Send request without c=NENG parameter, it should still map directly
+		req := `{"method":"mining.subscribe","params":["miner1"]}`
+		_, _ = conn.Write([]byte(req))
+
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("Read response error: %v", err)
+		}
+
+		resp := string(buf[:n])
+		if resp != "mock_response_from_pool_neng\n" {
+			t.Errorf("Unexpected response: %q", resp)
+		}
+	})
+
+	t.Run("Routes to NXE group from dedicated NXE port", func(t *testing.T) {
+		conn, err := net.Dial("tcp", nxeMinerAddr)
+		if err != nil {
+			t.Fatalf("Dial NXE miner port error: %v", err)
+		}
+		defer conn.Close()
+
+		// Send request without c=NXE parameter, it should still map directly
+		req := `{"method":"mining.subscribe","params":["miner1"]}`
+		_, _ = conn.Write([]byte(req))
+
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("Read response error: %v", err)
+		}
+
+		resp := string(buf[:n])
+		if resp != "mock_response_from_pool_nxe\n" {
+			t.Errorf("Unexpected response: %q", resp)
+		}
+	})
+}
+
 func TestStaticMapping(t *testing.T) {
 	dataChan := make(chan string, 10)
 
@@ -741,7 +855,7 @@ func TestStaticMapping(t *testing.T) {
 	defer cancel()
 
 	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
-	go runMinerAcceptLoop(ctx, minerListener, cm, tm)
+	go runMinerAcceptLoop(ctx, minerListener, cm, tm, "")
 
 	// Start Agent A: group_neng, priority 1 (primary)
 	agentAContext, cancelAgentA := context.WithCancel(ctx)

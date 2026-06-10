@@ -44,3 +44,14 @@ A hybrid production environment where:
 - **Agent 1 (NENG Primary)**: [agent_scenario3_neng_primary.json](file:///home/sena/Documents/script/proxy/examples/agent_scenario3_neng_primary.json)
 - **Agent 2 (NENG Backup)**: [agent_scenario3_neng_backup.json](file:///home/sena/Documents/script/proxy/examples/agent_scenario3_neng_backup.json)
 - **Agent 3 (NXE Static)**: [agent_scenario3_nxe_static.json](file:///home/sena/Documents/script/proxy/examples/agent_scenario3_nxe_static.json)
+
+---
+
+## Scenario 4: Multi-Difficulty Port Mapping
+
+### Description
+In this scenario, your local stratum pool backend uses different ports to listen for miners of different difficulties (e.g. Normal, Low, and High). You want the VPS to expose three matching dedicated ports. Connections coming into each VPS port are routed directly to the corresponding local pool port without needing custom protocol control headers.
+
+### Configuration Files
+- **VPS Server**: [backends_scenario4.json](file:///home/sena/Documents/script/proxy/examples/backends_scenario4.json)
+- **Local Agent Config**: [agent_scenario4.json](file:///home/sena/Documents/script/proxy/examples/agent_scenario4.json)

@@ -23,6 +23,7 @@ type Group struct {
 	Name          string   `json:"name"`
 	Coins         []string `json:"coins"`
 	StaticMapping bool     `json:"static_mapping"`
+	Listen        string   `json:"listen"`
 }
 
 type Config struct {
@@ -74,8 +75,15 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("decode JSON error: %w", err)
 	}
 
-	if cfg.Listen == "" {
-		return nil, errors.New("listen address is empty")
+	hasAnyListen := cfg.Listen != ""
+	for i := range cfg.Groups {
+		if cfg.Groups[i].Listen != "" {
+			hasAnyListen = true
+			break
+		}
+	}
+	if !hasAnyListen {
+		return nil, errors.New("neither global listen nor any group-specific listen addresses configured")
 	}
 
 	if cfg.TunnelListen == "" {
@@ -270,6 +278,8 @@ func (cw CountedWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+const Version = "1.3.0"
+
 func main() {
 	configPath := "backends.json"
 	if len(os.Args) > 1 {
@@ -277,7 +287,7 @@ func main() {
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("Starting Tunnel Stratum Proxy Server...")
+	log.Printf("Starting Tunnel Stratum Proxy Server v%s...", Version)
 
 	cfg, err := loadConfig(configPath)
 	if err != nil {
@@ -320,13 +330,30 @@ func main() {
 		log.Printf("Listening for Tunnel Agents on TCP %s (TLS not supported, no certs)", cfg.TunnelListen)
 	}
 
-	// Start miner acceptance port
-	minerListener, err := net.Listen("tcp", cfg.Listen)
-	if err != nil {
-		log.Fatalf("Fatal error starting miner listener on %s: %v", cfg.Listen, err)
+	var minerListeners []net.Listener
+
+	// Start global miner acceptance port if configured
+	if cfg.Listen != "" {
+		minerListener, err := net.Listen("tcp", cfg.Listen)
+		if err != nil {
+			log.Fatalf("Fatal error starting global miner listener on %s: %v", cfg.Listen, err)
+		}
+		minerListeners = append(minerListeners, minerListener)
+		log.Printf("Listening for Miners on global TCP %s", cfg.Listen)
 	}
-	defer minerListener.Close()
-	log.Printf("Listening for Miners on TCP %s", cfg.Listen)
+
+	// Start dedicated miner acceptance ports per group if configured
+	for i := range cfg.Groups {
+		g := &cfg.Groups[i]
+		if g.Listen != "" {
+			listener, err := net.Listen("tcp", g.Listen)
+			if err != nil {
+				log.Fatalf("Fatal error starting dedicated miner listener on %s for group %s: %v", g.Listen, g.Name, err)
+			}
+			minerListeners = append(minerListeners, listener)
+			log.Printf("Listening for Dedicated Miners on TCP %s for group %s", g.Listen, g.Name)
+		}
+	}
 
 	// Graceful shutdown setup
 	ctx, cancel := context.WithCancel(context.Background())
@@ -339,12 +366,30 @@ func main() {
 		log.Printf("Received signal %s, shutting down...", sig)
 		cancel()
 		_ = tunnelListener.Close()
-		_ = minerListener.Close()
+		for _, ml := range minerListeners {
+			_ = ml.Close()
+		}
 	}()
 
 	// Run acceptance loops
 	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
-	runMinerAcceptLoop(ctx, minerListener, cm, tm)
+
+	idx := 0
+	if cfg.Listen != "" {
+		go runMinerAcceptLoop(ctx, minerListeners[idx], cm, tm, "")
+		idx++
+	}
+	for i := range cfg.Groups {
+		g := &cfg.Groups[i]
+		if g.Listen != "" {
+			go runMinerAcceptLoop(ctx, minerListeners[idx], cm, tm, g.Name)
+			idx++
+		}
+	}
+
+	// Block main thread until context is done (graceful shutdown)
+	<-ctx.Done()
+	log.Printf("Proxy server exited.")
 }
 
 func watchConfig(path string, cm *ConfigManager) {
@@ -537,7 +582,7 @@ func handleTunnelRegistration(conn net.Conn, tm *TunnelManager, cm *ConfigManage
 	tm.Add(t)
 }
 
-func runMinerAcceptLoop(ctx context.Context, listener net.Listener, cm *ConfigManager, tm *TunnelManager) {
+func runMinerAcceptLoop(ctx context.Context, listener net.Listener, cm *ConfigManager, tm *TunnelManager, overrideGroupName string) {
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
@@ -550,11 +595,11 @@ func runMinerAcceptLoop(ctx context.Context, listener net.Listener, cm *ConfigMa
 			}
 		}
 
-		go handleMiner(clientConn, cm, tm)
+		go handleMiner(clientConn, cm, tm, overrideGroupName)
 	}
 }
 
-func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager) {
+func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, overrideGroupName string) {
 	clientAddr := clientConn.RemoteAddr().String()
 
 	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
@@ -574,33 +619,42 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager) {
 	firstChunk = firstChunk[:n]
 	_ = clientConn.SetReadDeadline(time.Time{})
 
-	// 2. Scan for coin symbol
+	// 2. Scan for coin symbol or use override
 	payloadStr := string(firstChunk)
 	cfg := cm.Get()
 	var matchedGroup *Group
 	var matchedCoin string
 
-	for i := range cfg.Groups {
-		g := &cfg.Groups[i]
-		for _, coin := range g.Coins {
-			tag := "c=" + coin
-			if strings.Contains(strings.ToLower(payloadStr), strings.ToLower(tag)) {
-				matchedGroup = g
-				matchedCoin = coin
+	if overrideGroupName != "" {
+		for i := range cfg.Groups {
+			if cfg.Groups[i].Name == overrideGroupName {
+				matchedGroup = &cfg.Groups[i]
 				break
 			}
 		}
-		if matchedGroup != nil {
-			break
-		}
-	}
-
-	// 3. Fallback to default group
-	if matchedGroup == nil {
+	} else {
 		for i := range cfg.Groups {
-			if cfg.Groups[i].Name == cfg.DefaultGroup {
-				matchedGroup = &cfg.Groups[i]
+			g := &cfg.Groups[i]
+			for _, coin := range g.Coins {
+				tag := "c=" + coin
+				if strings.Contains(strings.ToLower(payloadStr), strings.ToLower(tag)) {
+					matchedGroup = g
+					matchedCoin = coin
+					break
+				}
+			}
+			if matchedGroup != nil {
 				break
+			}
+		}
+
+		// 3. Fallback to default group
+		if matchedGroup == nil {
+			for i := range cfg.Groups {
+				if cfg.Groups[i].Name == cfg.DefaultGroup {
+					matchedGroup = &cfg.Groups[i]
+					break
+				}
 			}
 		}
 	}

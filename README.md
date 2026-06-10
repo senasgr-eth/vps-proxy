@@ -162,8 +162,11 @@ env GOOS=linux GOARCH=amd64 /usr/local/go/bin/go build -ldflags="-s -w" -o strat
 
 ---
 
-## How Priority and FIFO Logic Works
+## How Priority, FIFO, and Failback Cooldown Works
 
 1. **FIFO Pool Mapping**: The Agent maintains a constant pool of `pool_size` idle connections to the VPS. Inside the VPS, these connections are sorted by registration time (FIFO). When a miner connects, the VPS selects the oldest idle connection in the pool. This minimizes connection cycling.
 2. **Failover Priority**: If you run a Primary Agent (with `"priority": 1` in its `agent.json`) and a Backup Agent (with `"priority": 2` in its `agent.json`), the VPS always pops from the Priority 1 pool.
-3. **Seamless Failover & Fallback**: If the Primary Agent crashes or its network drops, the VPS automatically pops from the Priority 2 pool. Once the Primary Agent reconnects and registers its Priority 1 tunnels, the VPS immediately routes new connections to it without interrupting existing streams on the Backup Agent.
+3. **Failback Cooldown**: If the Primary Agent (Priority 1) goes offline, the VPS automatically routes new connections to the Backup Agent (Priority 2), triggering a **failback cooldown** (configured via `"failback_cooldown"`, e.g. `"8h"`). 
+4. **Cooldown Hold**: During the cooldown period (default: 8 hours), even if the Primary Agent comes back online, all new connections will **continue to route to the Backup Agent**. This prevents stratum miners from constantly jumping or cutting off.
+5. **Fail-safe Logic**: If the Backup Agent goes offline during the cooldown period, the server temporarily bypasses the cooldown lock to route new connections to the Primary Agent, keeping miners online.
+6. **Auto-Recovery**: Once the cooldown duration expires, new connections will naturally fall back to the Primary Agent (Priority 1) again.

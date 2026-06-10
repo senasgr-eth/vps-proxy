@@ -2,9 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -66,7 +73,7 @@ func startMockPool(t *testing.T, id string, dataChan chan<- string) (net.Listene
 }
 
 // startSimulatedAgent runs a background agent loop for testing.
-func startSimulatedAgent(ctx context.Context, t *testing.T, serverAddr, group string, priority int, localPoolAddr string, poolSize int) {
+func startSimulatedAgent(ctx context.Context, t *testing.T, serverAddr, group string, priority int, localPoolAddr string, poolSize int, token string, useTLS bool) {
 	slots := make(chan struct{}, poolSize)
 	for i := 0; i < poolSize; i++ {
 		slots <- struct{}{}
@@ -96,7 +103,18 @@ func startSimulatedAgent(ctx context.Context, t *testing.T, serverAddr, group st
 						slots <- struct{}{}
 					}()
 
-					conn, err := net.DialTimeout("tcp", serverAddr, 2*time.Second)
+					var conn net.Conn
+					var err error
+					dialer := &net.Dialer{Timeout: 2 * time.Second}
+					if useTLS {
+						tlsConf := &tls.Config{
+							InsecureSkipVerify: true,
+						}
+						conn, err = tls.DialWithDialer(dialer, "tcp", serverAddr, tlsConf)
+					} else {
+						conn, err = dialer.Dial("tcp", serverAddr)
+					}
+
 					if err != nil {
 						time.Sleep(50 * time.Millisecond)
 						return
@@ -126,7 +144,12 @@ func startSimulatedAgent(ctx context.Context, t *testing.T, serverAddr, group st
 					}()
 
 					// Send registration
-					regHeader := fmt.Sprintf("REG %s %d\n", group, priority)
+					var regHeader string
+					if token != "" {
+						regHeader = fmt.Sprintf("REG %s %d %s\n", group, priority, token)
+					} else {
+						regHeader = fmt.Sprintf("REG %s %d\n", group, priority)
+					}
 					_, err = conn.Write([]byte(regHeader))
 					if err != nil {
 						return
@@ -219,19 +242,19 @@ func TestRoutingAndFailover(t *testing.T) {
 	defer cancel()
 
 	// Run server loops
-	go runTunnelAcceptLoop(ctx, tunnelListener, tm)
+	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
 	go runMinerAcceptLoop(ctx, minerListener, cm, tm)
 
 	// Start Agents
 	agentAContext, cancelAgentA := context.WithCancel(ctx)
 	// Agent A: group_neng, priority 1 (primary)
-	startSimulatedAgent(agentAContext, t, tunnelServerAddr, "group_neng", 1, poolNeng1Addr, 3)
+	startSimulatedAgent(agentAContext, t, tunnelServerAddr, "group_neng", 1, poolNeng1Addr, 3, "", false)
 
 	// Agent B: group_neng, priority 2 (backup)
-	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_neng", 2, poolNeng2Addr, 3)
+	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_neng", 2, poolNeng2Addr, 3, "", false)
 
 	// Agent C: group_nxe, priority 1
-	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_nxe", 1, poolNxeAddr, 3)
+	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_nxe", 1, poolNxeAddr, 3, "", false)
 
 	// Wait for agents to register and fill connection pools
 	time.Sleep(500 * time.Millisecond)
@@ -373,7 +396,7 @@ func TestRoutingAndFailover(t *testing.T) {
 		// 1. Restart Agent A (Priority 1)
 		agentA2Context, cancelAgentA2 := context.WithCancel(ctx)
 		defer cancelAgentA2()
-		startSimulatedAgent(agentA2Context, t, tunnelServerAddr, "group_neng", 1, poolNeng1Addr, 3)
+		startSimulatedAgent(agentA2Context, t, tunnelServerAddr, "group_neng", 1, poolNeng1Addr, 3, "", false)
 
 		// Wait for registration
 		time.Sleep(300 * time.Millisecond)
@@ -504,4 +527,278 @@ func TestHotReload(t *testing.T) {
 	if cm.Get().DefaultGroup != "group_nxe" {
 		t.Errorf("Expected default group group_nxe after hot-reload, got %s", cm.Get().DefaultGroup)
 	}
+}
+
+func generateTestCertificate(t *testing.T) tls.Certificate {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate private key: %v", err)
+	}
+
+	notBefore := time.Now()
+	notAfter := notBefore.Add(365 * 24 * time.Hour)
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		t.Fatalf("Failed to generate serial number: %v", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"Test Proxy"},
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("Failed to create certificate: %v", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("Failed to load X509 key pair: %v", err)
+	}
+
+	return cert
+}
+
+func TestSecurityAuthentication(t *testing.T) {
+	dataChan := make(chan string, 10)
+
+	// Start local mock pool
+	_, poolAddr, cleanupPool := startMockPool(t, "neng_secure", dataChan)
+	defer cleanupPool()
+
+	// Load TLS Certificate dynamically in-memory
+	cert := generateTestCertificate(t)
+
+	cfg := &Config{
+		Listen:       "127.0.0.1:0",
+		TunnelListen: "127.0.0.1:0",
+		DefaultGroup: "group_neng",
+		SecretToken:  "super_secret_auth_token",
+		Groups: []Group{
+			{
+				Name:  "group_neng",
+				Coins: []string{"NENG"},
+			},
+		},
+	}
+
+	cm := &ConfigManager{cfg: cfg, tlsCert: &cert}
+	tm := NewTunnelManager()
+
+	// 1. Start Tunnel Server with standard TCP listener (dynamic TLS/TCP detection)
+	tunnelListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to start tunnel listener: %v", err)
+	}
+	defer tunnelListener.Close()
+	tunnelAddr := tunnelListener.Addr().String()
+
+	minerListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to start miner listener: %v", err)
+	}
+	defer minerListener.Close()
+	minerAddr := minerListener.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
+	go runMinerAcceptLoop(ctx, minerListener, cm, tm)
+
+	t.Run("Agent registers successfully with correct token and TLS", func(t *testing.T) {
+		agentCtx, cancelAgent := context.WithCancel(ctx)
+		defer cancelAgent()
+
+		startSimulatedAgent(agentCtx, t, tunnelAddr, "group_neng", 1, poolAddr, 1, "super_secret_auth_token", true)
+		time.Sleep(200 * time.Millisecond) // Wait for connection/registration
+
+		// Dial miner
+		conn, err := net.Dial("tcp", minerAddr)
+		if err != nil {
+			t.Fatalf("Dial miner port error: %v", err)
+		}
+		defer conn.Close()
+
+		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
+		_, _ = conn.Write([]byte(req))
+
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("Read response error: %v", err)
+		}
+
+		resp := string(buf[:n])
+		if resp != "mock_response_from_neng_secure\n" {
+			t.Errorf("Unexpected response: %q", resp)
+		}
+	})
+
+	t.Run("Agent registration rejected with wrong token", func(t *testing.T) {
+		agentCtx, cancelAgent := context.WithCancel(ctx)
+		defer cancelAgent()
+
+		startSimulatedAgent(agentCtx, t, tunnelAddr, "group_neng", 1, poolAddr, 1, "wrong_token", true)
+		time.Sleep(200 * time.Millisecond)
+
+		// Verification: no idle tunnels should be registered in the TunnelManager
+		conn, _, popErr := tm.PopBest("group_neng", 1*time.Second, false)
+		if popErr == nil {
+			conn.Close()
+			t.Errorf("Expected tunnel to be rejected, but it was accepted by server")
+		}
+	})
+
+	t.Run("Agent registers successfully without TLS (raw TCP)", func(t *testing.T) {
+		agentCtx, cancelAgent := context.WithCancel(ctx)
+		defer cancelAgent()
+
+		// Attempt raw TCP dial to port with correct token
+		startSimulatedAgent(agentCtx, t, tunnelAddr, "group_neng", 1, poolAddr, 1, "super_secret_auth_token", false)
+		time.Sleep(200 * time.Millisecond)
+
+		// Dial miner
+		conn, err := net.Dial("tcp", minerAddr)
+		if err != nil {
+			t.Fatalf("Dial miner port error: %v", err)
+		}
+		defer conn.Close()
+
+		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
+		_, _ = conn.Write([]byte(req))
+
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("Read response error: %v", err)
+		}
+
+		resp := string(buf[:n])
+		if resp != "mock_response_from_neng_secure\n" {
+			t.Errorf("Unexpected response: %q", resp)
+		}
+	})
+}
+
+func TestStaticMapping(t *testing.T) {
+	dataChan := make(chan string, 10)
+
+	// Start local backend pools
+	_, poolPrimaryAddr, cleanupPrimary := startMockPool(t, "pool_primary", dataChan)
+	defer cleanupPrimary()
+
+	_, poolBackupAddr, cleanupBackup := startMockPool(t, "pool_backup", dataChan)
+	defer cleanupBackup()
+
+	// Configure server with static_mapping = true for group_neng
+	cfg := &Config{
+		Listen:       "127.0.0.1:0",
+		TunnelListen: "127.0.0.1:0",
+		DefaultGroup: "group_neng",
+		Groups: []Group{
+			{
+				Name:          "group_neng",
+				Coins:         []string{"NENG"},
+				StaticMapping: true,
+			},
+		},
+	}
+
+	cm := &ConfigManager{cfg: cfg}
+	tm := NewTunnelManager()
+
+	tunnelListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen for tunnels: %v", err)
+	}
+	defer tunnelListener.Close()
+	tunnelServerAddr := tunnelListener.Addr().String()
+
+	minerListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen for miners: %v", err)
+	}
+	defer minerListener.Close()
+	minerServerAddr := minerListener.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
+	go runMinerAcceptLoop(ctx, minerListener, cm, tm)
+
+	// Start Agent A: group_neng, priority 1 (primary)
+	agentAContext, cancelAgentA := context.WithCancel(ctx)
+	startSimulatedAgent(agentAContext, t, tunnelServerAddr, "group_neng", 1, poolPrimaryAddr, 3, "", false)
+
+	// Start Agent B: group_neng, priority 2 (backup)
+	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_neng", 2, poolBackupAddr, 3, "", false)
+
+	// Wait for agents to register
+	time.Sleep(300 * time.Millisecond)
+
+	t.Run("Routes to Primary Agent (Priority 1) initially", func(t *testing.T) {
+		conn, err := net.Dial("tcp", minerServerAddr)
+		if err != nil {
+			t.Fatalf("Dial miner port error: %v", err)
+		}
+		defer conn.Close()
+
+		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
+		_, _ = conn.Write([]byte(req))
+
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("Read response error: %v", err)
+		}
+
+		resp := string(buf[:n])
+		if resp != "mock_response_from_pool_primary\n" {
+			t.Errorf("Unexpected response: %q", resp)
+		}
+	})
+
+	t.Run("Does NOT route to Backup (Priority 2) when Primary goes offline in static mapping", func(t *testing.T) {
+		// Stop Primary Agent
+		cancelAgentA()
+		time.Sleep(200 * time.Millisecond) // Wait for connection cleanup
+		tm.CleanDeadTunnels()
+
+		// Attempt to dial miner - routing should fail / timeout because Priority 2 is ignored
+		conn, err := net.Dial("tcp", minerServerAddr)
+		if err != nil {
+			t.Fatalf("Dial miner port error: %v", err)
+		}
+		defer conn.Close()
+
+		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
+		_, _ = conn.Write([]byte(req))
+
+		// We expect the server to timeout or close the connection without sending the mock backup response,
+		// because PopBest returns error (no idle tunnels for static mapping priority)
+		// and handleMiner closes miner connection on timeout/error.
+		_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		buf := make([]byte, 1024)
+		_, err = conn.Read(buf)
+		if err == nil {
+			t.Errorf("Expected routing to fail, but read data from connection")
+		}
+	})
 }

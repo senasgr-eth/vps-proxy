@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,8 +20,9 @@ import (
 )
 
 type Group struct {
-	Name  string   `json:"name"`
-	Coins []string `json:"coins"`
+	Name          string   `json:"name"`
+	Coins         []string `json:"coins"`
+	StaticMapping bool     `json:"static_mapping"`
 }
 
 type Config struct {
@@ -27,12 +30,16 @@ type Config struct {
 	TunnelListen     string  `json:"tunnel_listen"`
 	DefaultGroup     string  `json:"default_group"`
 	FailbackCooldown string  `json:"failback_cooldown"`
+	SecretToken      string  `json:"secret_token"`
+	TLSCert          string  `json:"tls_cert"`
+	TLSKey           string  `json:"tls_key"`
 	Groups           []Group `json:"groups"`
 }
 
 type ConfigManager struct {
-	mu  sync.RWMutex
-	cfg *Config
+	mu      sync.RWMutex
+	cfg     *Config
+	tlsCert *tls.Certificate
 }
 
 func (cm *ConfigManager) Get() *Config {
@@ -41,10 +48,17 @@ func (cm *ConfigManager) Get() *Config {
 	return cm.cfg
 }
 
-func (cm *ConfigManager) Set(cfg *Config) {
+func (cm *ConfigManager) GetCert() *tls.Certificate {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.tlsCert
+}
+
+func (cm *ConfigManager) Set(cfg *Config, cert *tls.Certificate) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.cfg = cfg
+	cm.tlsCert = cert
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -148,7 +162,8 @@ func (tm *TunnelManager) CleanDeadTunnels() {
 // PopBest pops the highest priority (lowest integer value) idle tunnel for the given group.
 // If multiple tunnels have the same priority, selects the oldest (FIFO).
 // If in cooldown, prefers backup tunnels (priority > 1) over primary tunnels (priority 1).
-func (tm *TunnelManager) PopBest(group string, cooldownDuration time.Duration) (net.Conn, int, error) {
+// If staticMapping is true, ignores backup tunnels (priority > 1) and disables failover.
+func (tm *TunnelManager) PopBest(group string, cooldownDuration time.Duration, staticMapping bool) (net.Conn, int, error) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -164,7 +179,7 @@ func (tm *TunnelManager) PopBest(group string, cooldownDuration time.Duration) (
 	}
 
 	inCooldown := false
-	if !state.LastFailoverTime.IsZero() && time.Since(state.LastFailoverTime) < cooldownDuration {
+	if !staticMapping && !state.LastFailoverTime.IsZero() && time.Since(state.LastFailoverTime) < cooldownDuration {
 		inCooldown = true
 	}
 
@@ -172,10 +187,18 @@ func (tm *TunnelManager) PopBest(group string, cooldownDuration time.Duration) (
 	byPriority := make(map[int][]*Tunnel)
 	minPriorityAvailable := 999999
 	for _, t := range list {
+		if staticMapping && t.priority > 1 {
+			// In static mapping mode, we strictly ignore backup agents (priority > 1)
+			continue
+		}
 		byPriority[t.priority] = append(byPriority[t.priority], t)
 		if t.priority < minPriorityAvailable {
 			minPriorityAvailable = t.priority
 		}
+	}
+
+	if len(byPriority) == 0 {
+		return nil, 0, errors.New("no idle tunnels available for static mapping priority")
 	}
 
 	var selectedPriority int
@@ -197,7 +220,7 @@ func (tm *TunnelManager) PopBest(group string, cooldownDuration time.Duration) (
 			selectedPriority = minPriorityAvailable
 		}
 	} else {
-		// Normal mode: prefer highest priority (lowest integer, e.g. Priority 1)
+		// Normal mode (or static mapping): prefer highest priority (lowest integer, e.g. Priority 1)
 		selectedPriority = minPriorityAvailable
 	}
 
@@ -221,7 +244,7 @@ func (tm *TunnelManager) PopBest(group string, cooldownDuration time.Duration) (
 	bestTunnel := list[candidateIdx]
 
 	// Detect failover transition (Normal mode -> switching to backup)
-	if !inCooldown && selectedPriority > 1 {
+	if !staticMapping && !inCooldown && selectedPriority > 1 {
 		state.LastFailoverTime = time.Now()
 		log.Printf("[TunnelManager] Failover detected for group %s. Switched to backup (priority %d). Locked on backup for %v.",
 			group, selectedPriority, cooldownDuration)
@@ -261,7 +284,16 @@ func main() {
 		log.Fatalf("Fatal error loading config: %v", err)
 	}
 
-	cm := &ConfigManager{cfg: cfg}
+	var tlsCert *tls.Certificate
+	if cfg.TLSCert != "" && cfg.TLSKey != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+		if err != nil {
+			log.Fatalf("Fatal error loading TLS key pair: %v", err)
+		}
+		tlsCert = &cert
+	}
+
+	cm := &ConfigManager{cfg: cfg, tlsCert: tlsCert}
 	tm := NewTunnelManager()
 
 	// Start configuration hot-reloader
@@ -275,13 +307,18 @@ func main() {
 		}
 	}()
 
-	// Start tunnel acceptance port
-	tunnelListener, err := net.Listen("tcp", cfg.TunnelListen)
-	if err != nil {
-		log.Fatalf("Fatal error starting tunnel listener on %s: %v", cfg.TunnelListen, err)
+	// Start tunnel acceptance port (uses raw TCP listener, dynamic TLS handled per connection)
+	tunnelListener, errTunnel := net.Listen("tcp", cfg.TunnelListen)
+	if errTunnel != nil {
+		log.Fatalf("Fatal error starting tunnel listener on %s: %v", cfg.TunnelListen, errTunnel)
 	}
 	defer tunnelListener.Close()
-	log.Printf("Listening for Tunnel Agents on TCP %s", cfg.TunnelListen)
+
+	if tlsCert != nil {
+		log.Printf("Listening for Tunnel Agents on TCP %s (TLS supported dynamically)", cfg.TunnelListen)
+	} else {
+		log.Printf("Listening for Tunnel Agents on TCP %s (TLS not supported, no certs)", cfg.TunnelListen)
+	}
 
 	// Start miner acceptance port
 	minerListener, err := net.Listen("tcp", cfg.Listen)
@@ -306,7 +343,7 @@ func main() {
 	}()
 
 	// Run acceptance loops
-	go runTunnelAcceptLoop(ctx, tunnelListener, tm)
+	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
 	runMinerAcceptLoop(ctx, minerListener, cm, tm)
 }
 
@@ -332,19 +369,30 @@ func watchConfig(path string, cm *ConfigManager) {
 				continue
 			}
 
+			var newCert *tls.Certificate
+			if newCfg.TLSCert != "" && newCfg.TLSKey != "" {
+				cert, err := tls.LoadX509KeyPair(newCfg.TLSCert, newCfg.TLSKey)
+				if err != nil {
+					log.Printf("Failed to load new TLS key pair: %v (keeping current certificates)", err)
+					newCert = cm.GetCert()
+				} else {
+					newCert = &cert
+				}
+			}
+
 			oldCfg := cm.Get()
 			if oldCfg.Listen != newCfg.Listen || oldCfg.TunnelListen != newCfg.TunnelListen {
 				log.Printf("WARNING: Listen/TunnelListen addresses changed in config, but this requires a manual restart to take effect.")
 			}
 
-			cm.Set(newCfg)
+			cm.Set(newCfg, newCert)
 			lastModTime = fi.ModTime()
 			log.Printf("Config successfully hot-reloaded")
 		}
 	}
 }
 
-func runTunnelAcceptLoop(ctx context.Context, listener net.Listener, tm *TunnelManager) {
+func runTunnelAcceptLoop(ctx context.Context, listener net.Listener, tm *TunnelManager, cm *ConfigManager) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -357,11 +405,21 @@ func runTunnelAcceptLoop(ctx context.Context, listener net.Listener, tm *TunnelM
 			}
 		}
 
-		go handleTunnelRegistration(conn, tm)
+		go handleTunnelRegistration(conn, tm, cm)
 	}
 }
 
-func handleTunnelRegistration(conn net.Conn, tm *TunnelManager) {
+// BufferedConn wraps a net.Conn and overrides Read to read from a pre-buffered stream first.
+type BufferedConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (bc *BufferedConn) Read(p []byte) (int, error) {
+	return bc.r.Read(p)
+}
+
+func handleTunnelRegistration(conn net.Conn, tm *TunnelManager, cm *ConfigManager) {
 	clientAddr := conn.RemoteAddr().String()
 
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
@@ -369,15 +427,55 @@ func handleTunnelRegistration(conn net.Conn, tm *TunnelManager) {
 		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
 	}
 
-	// Read registration line: "REG <group_name> <priority>\n"
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	wrappedConn := conn
+	tlsCert := cm.GetCert()
+
+	if tlsCert != nil {
+		// Read first byte to detect if it's a TLS Handshake (0x16)
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		firstByte := make([]byte, 1)
+		_, err := io.ReadFull(conn, firstByte)
+		_ = conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			log.Printf("[%s] Error reading first byte for TLS detection: %v", clientAddr, err)
+			_ = conn.Close()
+			return
+		}
+
+		// Reconstruct the connection with the first byte prepended
+		wrappedConn = &BufferedConn{
+			Conn: conn,
+			r:    io.MultiReader(bytes.NewReader(firstByte), conn),
+		}
+
+		if firstByte[0] == 0x16 {
+			// This is a TLS Handshake ClientHello. Wrap in tls.Server
+			tlsConfig := &tls.Config{
+				Certificates: []tls.Certificate{*tlsCert},
+			}
+			tlsConn := tls.Server(wrappedConn, tlsConfig)
+			// Force handshake check
+			_ = tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			err = tlsConn.Handshake()
+			_ = tlsConn.SetReadDeadline(time.Time{})
+			if err != nil {
+				log.Printf("[%s] TLS handshake failed: %v", clientAddr, err)
+				_ = tlsConn.Close()
+				return
+			}
+			wrappedConn = tlsConn
+		}
+	}
+
+	// Read registration line: "REG <group_name> <priority>\n" or "REG <group_name> <priority> <token>\n"
+	_ = wrappedConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var line []byte
 	buf := make([]byte, 1)
 	for {
-		n, err := conn.Read(buf)
+		n, err := wrappedConn.Read(buf)
 		if err != nil {
 			log.Printf("[%s] Tunnel registration read error: %v", clientAddr, err)
-			_ = conn.Close()
+			_ = wrappedConn.Close()
 			return
 		}
 		if n > 0 {
@@ -388,16 +486,27 @@ func handleTunnelRegistration(conn net.Conn, tm *TunnelManager) {
 		}
 		if len(line) > 128 {
 			log.Printf("[%s] Tunnel registration line too long", clientAddr)
-			_ = conn.Close()
+			_ = wrappedConn.Close()
 			return
 		}
 	}
-	_ = conn.SetReadDeadline(time.Time{}) // Reset deadline
+	_ = wrappedConn.SetReadDeadline(time.Time{}) // Reset deadline
 
 	parts := strings.Fields(strings.TrimSpace(string(line)))
-	if len(parts) != 3 || parts[0] != "REG" {
-		log.Printf("[%s] Invalid tunnel registration prefix: %q", clientAddr, string(line))
-		_ = conn.Close()
+	cfg := cm.Get()
+
+	// If secret_token is configured on server, registration must have 4 parts: "REG <group> <priority> <token>"
+	// Otherwise, it has 3 parts: "REG <group> <priority>"
+	var expectedParts int
+	if cfg.SecretToken != "" {
+		expectedParts = 4
+	} else {
+		expectedParts = 3
+	}
+
+	if len(parts) != expectedParts || parts[0] != "REG" {
+		log.Printf("[%s] Invalid tunnel registration line: %q", clientAddr, string(line))
+		_ = wrappedConn.Close()
 		return
 	}
 
@@ -406,12 +515,21 @@ func handleTunnelRegistration(conn net.Conn, tm *TunnelManager) {
 	_, err := fmt.Sscanf(parts[2], "%d", &priority)
 	if err != nil {
 		log.Printf("[%s] Invalid tunnel registration priority: %q", clientAddr, parts[2])
-		_ = conn.Close()
+		_ = wrappedConn.Close()
 		return
 	}
 
+	if cfg.SecretToken != "" {
+		token := parts[3]
+		if token != cfg.SecretToken {
+			log.Printf("[%s] Tunnel registration failed: invalid secret token", clientAddr)
+			_ = wrappedConn.Close()
+			return
+		}
+	}
+
 	t := &Tunnel{
-		conn:     conn,
+		conn:     wrappedConn,
 		group:    groupName,
 		priority: priority,
 		addedAt:  time.Now(),
@@ -509,7 +627,7 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager) {
 	}
 
 	for {
-		tunnelConn, tunnelPriority, popErr = tm.PopBest(matchedGroup.Name, cooldown)
+		tunnelConn, tunnelPriority, popErr = tm.PopBest(matchedGroup.Name, cooldown, matchedGroup.StaticMapping)
 		if popErr == nil {
 			// Test the tunnel connection by writing the first chunk
 			_, err = tunnelConn.Write(firstChunk)

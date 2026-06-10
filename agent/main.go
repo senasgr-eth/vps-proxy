@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,9 +19,13 @@ type Mapping struct {
 }
 
 type Config struct {
-	Server   string    `json:"server"`
-	PoolSize int       `json:"pool_size"`
-	Mappings []Mapping `json:"mappings"`
+	Server        string    `json:"server"`
+	PoolSize      int       `json:"pool_size"`
+	SecretToken   string    `json:"secret_token"`
+	TLSSkipVerify bool      `json:"tls_skip_verify"`
+	TLS           bool      `json:"tls"`
+	Insecure      bool      `json:"insecure"`
+	Mappings      []Mapping `json:"mappings"`
 }
 
 func main() {
@@ -58,19 +63,19 @@ func main() {
 		wg.Add(1)
 		go func(mapping Mapping) {
 			defer wg.Done()
-			maintainTunnelPool(cfg.Server, cfg.PoolSize, mapping)
+			maintainTunnelPool(cfg, mapping)
 		}(m)
 	}
 
 	wg.Wait()
 }
 
-func maintainTunnelPool(server string, poolSize int, mapping Mapping) {
+func maintainTunnelPool(cfg Config, mapping Mapping) {
 	log.Printf("[PoolManager] Starting pool for group %s (priority: %d, local pool: %s)",
 		mapping.Group, mapping.Priority, mapping.Local)
 
-	slots := make(chan struct{}, poolSize)
-	for i := 0; i < poolSize; i++ {
+	slots := make(chan struct{}, cfg.PoolSize)
+	for i := 0; i < cfg.PoolSize; i++ {
 		slots <- struct{}{}
 	}
 
@@ -82,7 +87,7 @@ func maintainTunnelPool(server string, poolSize int, mapping Mapping) {
 				slots <- struct{}{} // Release slot on exit
 			}()
 
-			runTunnelSession(server, mapping)
+			runTunnelSession(cfg, mapping)
 		}()
 
 		// Small delay to prevent tight-loop CPU spike if VPS drops connections immediately
@@ -90,11 +95,23 @@ func maintainTunnelPool(server string, poolSize int, mapping Mapping) {
 	}
 }
 
-func runTunnelSession(server string, mapping Mapping) {
-	// 1. Dial VPS
-	vpsConn, err := net.DialTimeout("tcp", server, 10*time.Second)
+func runTunnelSession(cfg Config, mapping Mapping) {
+	// 1. Dial VPS (secure TLS by default, raw TCP if configured insecure)
+	var vpsConn net.Conn
+	var err error
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+
+	if cfg.TLS {
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: cfg.TLSSkipVerify,
+		}
+		vpsConn, err = tls.DialWithDialer(dialer, "tcp", cfg.Server, tlsConfig)
+	} else {
+		vpsConn, err = dialer.Dial("tcp", cfg.Server)
+	}
+
 	if err != nil {
-		log.Printf("[Tunnel-%s] Error dialling VPS %s: %v. Retrying in 5s...", mapping.Group, server, err)
+		log.Printf("[Tunnel-%s] Error dialling VPS %s: %v. Retrying in 5s...", mapping.Group, cfg.Server, err)
 		time.Sleep(5 * time.Second)
 		return
 	}
@@ -105,8 +122,14 @@ func runTunnelSession(server string, mapping Mapping) {
 		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
 	}
 
-	// 2. Send registration header: "REG <group> <priority>\n"
-	regHeader := fmt.Sprintf("REG %s %d\n", mapping.Group, mapping.Priority)
+	// 2. Send registration header: "REG <group> <priority> <token>\n" or "REG <group> <priority>\n"
+	var regHeader string
+	if cfg.SecretToken != "" {
+		regHeader = fmt.Sprintf("REG %s %d %s\n", mapping.Group, mapping.Priority, cfg.SecretToken)
+	} else {
+		regHeader = fmt.Sprintf("REG %s %d\n", mapping.Group, mapping.Priority)
+	}
+
 	_ = vpsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_, err = vpsConn.Write([]byte(regHeader))
 	if err != nil {

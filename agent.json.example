@@ -6,6 +6,16 @@
   // When a connection is used, a new one is automatically dialed to replenish the pool.
   "pool_size": 5,
 
+  // Shared secret token to authorize with the VPS Server (sent securely over TLS)
+  "secret_token": "a_very_long_secure_shared_token_string",
+
+  // Set to true to bypass standard SSL certificate validation (useful for self-signed certificates)
+  "tls_skip_verify": true,
+
+  // Set to true to use raw unencrypted TCP tunnels. This should only be used for testing,
+  // or if proxying traffic inside a secure local network.
+  "insecure": false,
+
   // Mapping of VPS coin groups to your local backend pools
   "mappings": [
     {

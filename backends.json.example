@@ -13,15 +13,26 @@
   // Accepts duration formats like "8h", "30m", or "2h30m".
   "failback_cooldown": "8h",
 
+  // Shared secret token to authorize agents (sent securely over TLS)
+  "secret_token": "a_very_long_secure_shared_token_string",
+
+  // Paths to the TLS certificate and private key files on the VPS
+  "tls_cert": "/etc/stratum-proxy/cert.pem",
+  "tls_key": "/etc/stratum-proxy/key.pem",
+
   // Mining coin routing groups
   "groups": [
     {
       "name": "group_neng",
-      "coins": ["NENG", "NXE", "MTBC"]
+      "coins": ["NENG", "NXE", "MTBC"],
+      // Set to true to disable automatic failover to backups for this group.
+      // Useful if backends support only specific coins and must not receive others.
+      "static_mapping": false
     },
     {
       "name": "group_nxe",
-      "coins": ["BTG", "BTB", "XXX"]
+      "coins": ["BTG", "BTB", "XXX"],
+      "static_mapping": true
     }
   ]
 }

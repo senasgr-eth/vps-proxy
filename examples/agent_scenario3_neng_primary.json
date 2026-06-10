@@ -1,0 +1,14 @@
+{
+  "server": "vps_public_ip:44444",
+  "pool_size": 5,
+  "secret_token": "token_for_scenario_3",
+  "tls": true,
+  "tls_skip_verify": true,
+  "mappings": [
+    {
+      "group": "group_neng",
+      "priority": 1,
+      "local": "127.0.0.1:32221"
+    }
+  ]
+}

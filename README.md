@@ -37,33 +37,42 @@ graph TD
 ## Configuration
 
 ### 1. Server Configuration (`/etc/stratum-proxy/backends.json`)
-Placed on the VPS. It configures the port for miners and the port for the agents to connect:
+Placed on the VPS. It configures the port for miners, the port for the agents, security settings, and coin routing groups:
 
 ```json
 {
   "listen": "0.0.0.0:33333",
   "tunnel_listen": "0.0.0.0:44444",
   "default_group": "group_neng",
+  "failback_cooldown": "8h",
+  "secret_token": "a_very_long_secure_shared_token_string",
+  "tls_cert": "/etc/stratum-proxy/cert.pem",
+  "tls_key": "/etc/stratum-proxy/key.pem",
   "groups": [
     {
       "name": "group_neng",
-      "coins": ["NENG", "NXE", "MTBC"]
+      "coins": ["NENG", "NXE", "MTBC"],
+      "static_mapping": false
     },
     {
       "name": "group_nxe",
-      "coins": ["BTG", "BTB", "XXX"]
+      "coins": ["BTG", "BTB", "XXX"],
+      "static_mapping": true
     }
   ]
 }
 ```
 
 ### 2. Agent Configuration (`/etc/stratum-agent/agent.json`)
-Placed on the local mining pool machine. It establishes tunnel pools matching coin groups:
+Placed on the local mining pool machine. It establishes tunnel pools matching coin groups, and controls whether to connect securely over TLS:
 
 ```json
 {
   "server": "vps_public_ip:44444",
   "pool_size": 5,
+  "secret_token": "a_very_long_secure_shared_token_string",
+  "tls": true,
+  "tls_skip_verify": true,
   "mappings": [
     {
       "group": "group_neng",
@@ -78,6 +87,28 @@ Placed on the local mining pool machine. It establishes tunnel pools matching co
   ]
 }
 ```
+
+---
+
+## Security & Encryption (Optional TLS & Token Auth)
+
+To protect your tunnel connections from unauthorized agents and eavesdropping, the proxy features a secure authentication and encryption layer:
+
+1. **Pre-Shared Token Authentication**: Only authorized Agents that present the configured `secret_token` can register tunnels with the VPS. The server immediately closes connections with missing or invalid tokens.
+2. **Dynamic TLS Detection (Optional)**: TLS is optional.
+   - **On the Agent**: If `"tls": true` is specified in `agent.json`, the agent initiates a TLS connection to wrap all tunnel traffic. If `"tls": false` (or omitted), it connects using raw TCP (passing raw data).
+   - **On the VPS Server**: If `tls_cert` and `tls_key` are specified in `backends.json`, the server supports TLS dynamically on the *same* tunnel port. It inspects the first byte of incoming connections. If a TLS handshake is detected (first byte is `0x16`), it negotiates TLS; if not, it falls back to raw TCP.
+
+### Generating a Self-Signed TLS Certificate
+
+For ease of deployment, you can generate a self-signed certificate directly on the VPS to use for the tunnel encryption:
+
+```bash
+# Generate a self-signed certificate and private key valid for 10 years (3650 days)
+sudo openssl req -x509 -newkey rsa:4096 -nodes -keyout /etc/stratum-proxy/key.pem -out /etc/stratum-proxy/cert.pem -sha256 -days 3650 -subj "/CN=stratum-proxy"
+```
+
+Once generated, make sure to point the `tls_cert` and `tls_key` fields in `backends.json` to these paths, and set `"tls": true` in `agent.json`.
 
 ---
 
@@ -170,3 +201,4 @@ env GOOS=linux GOARCH=amd64 /usr/local/go/bin/go build -ldflags="-s -w" -o strat
 4. **Cooldown Hold**: During the cooldown period (default: 8 hours), even if the Primary Agent comes back online, all new connections will **continue to route to the Backup Agent**. This prevents stratum miners from constantly jumping or cutting off.
 5. **Fail-safe Logic**: If the Backup Agent goes offline during the cooldown period, the server temporarily bypasses the cooldown lock to route new connections to the Primary Agent, keeping miners online.
 6. **Auto-Recovery**: Once the cooldown duration expires, new connections will naturally fall back to the Primary Agent (Priority 1) again.
+7. **Static Mapping**: If `"static_mapping": true` is configured on a coin group, automatic failover is completely disabled. Miner connections will strictly route to the Primary Agent (Priority 1). If the Primary Agent is offline, the connection will fail immediately and will NOT fall back to Priority 2. This is useful when the backup stratum backend does not support the same coins as the primary backend.

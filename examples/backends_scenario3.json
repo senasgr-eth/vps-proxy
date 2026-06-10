@@ -1,0 +1,21 @@
+{
+  "listen": "0.0.0.0:33333",
+  "tunnel_listen": "0.0.0.0:44444",
+  "default_group": "group_neng",
+  "failback_cooldown": "4h",
+  "secret_token": "token_for_scenario_3",
+  "tls_cert": "/etc/stratum-proxy/cert.pem",
+  "tls_key": "/etc/stratum-proxy/key.pem",
+  "groups": [
+    {
+      "name": "group_neng",
+      "coins": ["NENG"],
+      "static_mapping": false
+    },
+    {
+      "name": "group_nxe",
+      "coins": ["NXE"],
+      "static_mapping": true
+    }
+  ]
+}

@@ -55,3 +55,22 @@ In this scenario, your local stratum pool backend uses different ports to listen
 ### Configuration Files
 - **VPS Server**: [backends_scenario4.json](file:///home/sena/Documents/script/proxy/examples/backends_scenario4.json)
 - **Local Agent Config**: [agent_scenario4.json](file:///home/sena/Documents/script/proxy/examples/agent_scenario4.json)
+
+---
+
+## Scenario 5: Large Hybrid Environment (Dynamic Routing + Multiple Dedicated Ports)
+
+### Description
+A large-scale hybrid mining layout containing multiple coins (NENG, NXE, MTBC, DOGE, LTC, BTC, BCH) where:
+- A global port (`33330`) dynamically routes incoming miners to either the Scrypt (`group_neng_dynamic` supporting NENG/MTBC) or SHA256 (`group_sha256_dynamic` supporting BTC/BCH) backend pools based on payload parsing.
+- Dedicated VPS ports route traffic directly to specific coins or difficulty levels without checking payload content:
+  - Port `33331` maps directly to Scrypt Low-Difficulty NENG.
+  - Port `33332` maps directly to Scrypt High-Difficulty NENG.
+  - Port `33333` maps directly to dedicated NXE mining.
+  - Port `33334` maps directly to dedicated DOGE mining.
+  - Port `33335` maps directly to dedicated LTC mining.
+
+### Configuration Files
+- **VPS Server**: [backends_scenario5.json](file:///home/sena/Documents/script/proxy/examples/backends_scenario5.json)
+- **Local Scrypt Agent**: [agent_scenario5_scrypt.json](file:///home/sena/Documents/script/proxy/examples/agent_scenario5_scrypt.json)
+- **Local SHA256 Agent**: [agent_scenario5_sha256.json](file:///home/sena/Documents/script/proxy/examples/agent_scenario5_sha256.json)

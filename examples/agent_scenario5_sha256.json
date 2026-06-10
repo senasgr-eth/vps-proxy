@@ -1,0 +1,14 @@
+{
+  "server": "vps_public_ip:44444",
+  "pool_size": 4,
+  "secret_token": "token_for_scenario_5",
+  "tls": true,
+  "tls_skip_verify": true,
+  "mappings": [
+    {
+      "group": "group_sha256_dynamic",
+      "priority": 1,
+      "local": "127.0.0.1:40001" // SHA256 dynamic stratum port (handles both BTC and BCH)
+    }
+  ]
+}

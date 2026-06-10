@@ -1,0 +1,39 @@
+{
+  "server": "vps_public_ip:44444",
+  "pool_size": 8,
+  "secret_token": "token_for_scenario_5",
+  "tls": true,
+  "tls_skip_verify": true,
+  "mappings": [
+    {
+      "group": "group_neng_dynamic",
+      "priority": 1,
+      "local": "127.0.0.1:30001" // Scrypt/NENG dynamic stratum port on local pool
+    },
+    {
+      "group": "group_neng_low",
+      "priority": 1,
+      "local": "127.0.0.1:30002" // Scrypt/NENG low-difficulty stratum port on local pool
+    },
+    {
+      "group": "group_neng_high",
+      "priority": 1,
+      "local": "127.0.0.1:30003" // Scrypt/NENG high-difficulty stratum port on local pool
+    },
+    {
+      "group": "group_nxe_dedicated",
+      "priority": 1,
+      "local": "127.0.0.1:30004" // NXE stratum port on local pool
+    },
+    {
+      "group": "group_doge_dedicated",
+      "priority": 1,
+      "local": "127.0.0.1:30005" // DOGE stratum port on local pool
+    },
+    {
+      "group": "group_ltc_dedicated",
+      "priority": 1,
+      "local": "127.0.0.1:30006" // LTC stratum port on local pool
+    }
+  ]
+}

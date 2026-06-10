@@ -1,0 +1,27 @@
+{
+  // Port where miners connect (Stratum mining client)
+  "listen": "0.0.0.0:33333",
+
+  // Port where Tunnel Agents connect from behind the NAT
+  "tunnel_listen": "0.0.0.0:44444",
+
+  // Default coin group if a miner connection does not send a matching coin symbol
+  "default_group": "group_neng",
+
+  // Cooldown duration to lock connections onto backup agents after a failover.
+  // Set to prevent miners from connection cutoff/jumping.
+  // Accepts duration formats like "8h", "30m", or "2h30m".
+  "failback_cooldown": "8h",
+
+  // Mining coin routing groups
+  "groups": [
+    {
+      "name": "group_neng",
+      "coins": ["NENG", "NXE", "MTBC"]
+    },
+    {
+      "name": "group_nxe",
+      "coins": ["BTG", "BTB", "XXX"]
+    }
+  ]
+}

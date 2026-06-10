@@ -1,0 +1,17 @@
+[Unit]
+Description=Go Stratum TCP Proxy Agent (Tunnel Client)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/stratum-agent
+ExecStart=/usr/local/bin/stratum-agent /etc/stratum-agent/agent.json
+Restart=always
+RestartSec=5
+
+# Increase open file limits to support concurrent connections
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

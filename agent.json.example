@@ -1,0 +1,29 @@
+{
+  // Public static IP and tunnel port of the VPS Server
+  "server": "vps_public_ip:44444",
+
+  // Number of idle TCP connections to keep open to the VPS to handle new miner streams instantly.
+  // When a connection is used, a new one is automatically dialed to replenish the pool.
+  "pool_size": 5,
+
+  // Mapping of VPS coin groups to your local backend pools
+  "mappings": [
+    {
+      "group": "group_neng",
+
+      // Priority level of this agent for the group:
+      // - Priority 1: Primary backend pool.
+      // - Priority 2: Backup backend pool.
+      // The VPS server will always route miners to Priority 1 if available.
+      "priority": 1,
+
+      // Address of the local mining pool instance running on this backend machine
+      "local": "127.0.0.1:32221"
+    },
+    {
+      "group": "group_nxe",
+      "priority": 1,
+      "local": "127.0.0.1:32222"
+    }
+  ]
+}

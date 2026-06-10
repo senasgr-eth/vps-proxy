@@ -1,0 +1,17 @@
+[Unit]
+Description=Go Stratum TCP Proxy Server (Tunnel Server)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/stratum-proxy
+ExecStart=/usr/local/bin/stratum-proxy /etc/stratum-proxy/backends.json
+Restart=always
+RestartSec=5
+
+# Increase open file limits to support thousands of concurrent miner connections
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

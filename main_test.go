@@ -74,7 +74,7 @@ func startMockPool(t *testing.T, id string, dataChan chan<- string) (net.Listene
 }
 
 // startSimulatedAgent runs a background agent loop for testing.
-func startSimulatedAgent(ctx context.Context, t *testing.T, serverAddr, group string, priority int, localPoolAddr string, poolSize int, token string, useTLS bool) {
+func startSimulatedAgent(ctx context.Context, t *testing.T, serverAddr, group string, localPoolAddr string, poolSize int, token string, useTLS bool) {
 	slots := make(chan struct{}, poolSize)
 	for i := 0; i < poolSize; i++ {
 		slots <- struct{}{}
@@ -144,12 +144,12 @@ func startSimulatedAgent(ctx context.Context, t *testing.T, serverAddr, group st
 						mu.Unlock()
 					}()
 
-					// Send registration
+					// Send registration (simplified format)
 					var regHeader string
 					if token != "" {
-						regHeader = fmt.Sprintf("REG %s %d %s\n", group, priority, token)
+						regHeader = fmt.Sprintf("REG %s %s\n", group, token)
 					} else {
-						regHeader = fmt.Sprintf("REG %s %d\n", group, priority)
+						regHeader = fmt.Sprintf("REG %s\n", group)
 					}
 					_, err = conn.Write([]byte(regHeader))
 					if err != nil {
@@ -190,33 +190,27 @@ func startSimulatedAgent(ctx context.Context, t *testing.T, serverAddr, group st
 	}()
 }
 
-func TestRoutingAndFailover(t *testing.T) {
+func TestMultipleMinerPorts(t *testing.T) {
 	dataChan := make(chan string, 10)
 
 	// Start local backend pools
-	_, poolNeng1Addr, cleanupNeng1 := startMockPool(t, "neng_primary", dataChan)
-	defer cleanupNeng1()
+	_, poolNengAddr, cleanupNeng := startMockPool(t, "pool_neng", dataChan)
+	defer cleanupNeng()
 
-	_, poolNeng2Addr, cleanupNeng2 := startMockPool(t, "neng_backup", dataChan)
-	defer cleanupNeng2()
-
-	_, poolNxeAddr, cleanupNxe := startMockPool(t, "nxe_pool", dataChan)
+	_, poolNxeAddr, cleanupNxe := startMockPool(t, "pool_nxe", dataChan)
 	defer cleanupNxe()
 
-	// Configure server
+	// Configure server with dedicated ports for both groups
 	cfg := &Config{
-		Listen:           "127.0.0.1:0",
-		TunnelListen:     "127.0.0.1:0",
-		DefaultGroup:     "group_neng",
-		FailbackCooldown: "1s",
+		TunnelListen: "127.0.0.1:0",
 		Groups: []Group{
 			{
-				Name:  "group_neng",
-				Coins: []string{"NENG", "NXE"},
+				Name:   "group_neng",
+				Listen: "127.0.0.1:0",
 			},
 			{
-				Name:  "group_nxe",
-				Coins: []string{"BTG", "BTB"},
+				Name:   "group_nxe",
+				Listen: "127.0.0.1:0",
 			},
 		},
 	}
@@ -224,7 +218,6 @@ func TestRoutingAndFailover(t *testing.T) {
 	cm := &ConfigManager{cfg: cfg}
 	tm := NewTunnelManager()
 
-	// Start Tunnel Server listeners on OS-allocated ports
 	tunnelListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to listen for tunnels: %v", err)
@@ -232,42 +225,42 @@ func TestRoutingAndFailover(t *testing.T) {
 	defer tunnelListener.Close()
 	tunnelServerAddr := tunnelListener.Addr().String()
 
-	minerListener, err := net.Listen("tcp", "127.0.0.1:0")
+	nengMinerListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("Failed to listen for miners: %v", err)
+		t.Fatalf("Failed to listen for NENG miners: %v", err)
 	}
-	defer minerListener.Close()
-	minerServerAddr := minerListener.Addr().String()
+	defer nengMinerListener.Close()
+	nengMinerAddr := nengMinerListener.Addr().String()
+
+	nxeMinerListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen for NXE miners: %v", err)
+	}
+	defer nxeMinerListener.Close()
+	nxeMinerAddr := nxeMinerListener.Addr().String()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Run server loops
+	// Start accept loops
 	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
-	go runMinerAcceptLoop(ctx, minerListener, cm, tm, "")
+	go runMinerAcceptLoop(ctx, nengMinerListener, cm, tm, "group_neng")
+	go runMinerAcceptLoop(ctx, nxeMinerListener, cm, tm, "group_nxe")
 
 	// Start Agents
-	agentAContext, cancelAgentA := context.WithCancel(ctx)
-	// Agent A: group_neng, priority 1 (primary)
-	startSimulatedAgent(agentAContext, t, tunnelServerAddr, "group_neng", 1, poolNeng1Addr, 3, "", false)
+	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_neng", poolNengAddr, 3, "", false)
+	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_nxe", poolNxeAddr, 3, "", false)
 
-	// Agent B: group_neng, priority 2 (backup)
-	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_neng", 2, poolNeng2Addr, 3, "", false)
+	time.Sleep(300 * time.Millisecond) // Wait for agents
 
-	// Agent C: group_nxe, priority 1
-	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_nxe", 1, poolNxeAddr, 3, "", false)
-
-	// Wait for agents to register and fill connection pools
-	time.Sleep(500 * time.Millisecond)
-
-	t.Run("Route to Agent A (Priority 1) for NENG", func(t *testing.T) {
-		conn, err := net.Dial("tcp", minerServerAddr)
+	t.Run("Routes to NENG group from dedicated NENG port", func(t *testing.T) {
+		conn, err := net.Dial("tcp", nengMinerAddr)
 		if err != nil {
-			t.Fatalf("Dial miner port error: %v", err)
+			t.Fatalf("Dial NENG miner port error: %v", err)
 		}
 		defer conn.Close()
 
-		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
+		req := `{"method":"mining.subscribe","params":["miner1"]}`
 		_, _ = conn.Write([]byte(req))
 
 		buf := make([]byte, 1024)
@@ -277,28 +270,19 @@ func TestRoutingAndFailover(t *testing.T) {
 		}
 
 		resp := string(buf[:n])
-		if resp != "mock_response_from_neng_primary\n" {
+		if resp != "mock_response_from_pool_neng\n" {
 			t.Errorf("Unexpected response: %q", resp)
-		}
-
-		select {
-		case data := <-dataChan:
-			if data != "neng_primary:"+req {
-				t.Errorf("Backend got unexpected data: %q", data)
-			}
-		case <-time.After(1 * time.Second):
-			t.Errorf("Timeout waiting for backend data")
 		}
 	})
 
-	t.Run("Route to Agent C for BTG", func(t *testing.T) {
-		conn, err := net.Dial("tcp", minerServerAddr)
+	t.Run("Routes to NXE group from dedicated NXE port", func(t *testing.T) {
+		conn, err := net.Dial("tcp", nxeMinerAddr)
 		if err != nil {
-			t.Fatalf("Dial miner port error: %v", err)
+			t.Fatalf("Dial NXE miner port error: %v", err)
 		}
 		defer conn.Close()
 
-		req := `{"method":"mining.subscribe","params":["miner1","c=BTG"]}`
+		req := `{"method":"mining.subscribe","params":["miner1"]}`
 		_, _ = conn.Write([]byte(req))
 
 		buf := make([]byte, 1024)
@@ -308,160 +292,8 @@ func TestRoutingAndFailover(t *testing.T) {
 		}
 
 		resp := string(buf[:n])
-		if resp != "mock_response_from_nxe_pool\n" {
+		if resp != "mock_response_from_pool_nxe\n" {
 			t.Errorf("Unexpected response: %q", resp)
-		}
-
-		select {
-		case data := <-dataChan:
-			if data != "nxe_pool:"+req {
-				t.Errorf("Backend got unexpected data: %q", data)
-			}
-		case <-time.After(1 * time.Second):
-			t.Errorf("Timeout waiting for backend data")
-		}
-	})
-
-	t.Run("Route to Default Group (Agent A, Priority 1) on mismatch", func(t *testing.T) {
-		conn, err := net.Dial("tcp", minerServerAddr)
-		if err != nil {
-			t.Fatalf("Dial miner port error: %v", err)
-		}
-		defer conn.Close()
-
-		req := `{"method":"mining.subscribe","params":["miner1","c=OTHER"]}`
-		_, _ = conn.Write([]byte(req))
-
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		if err != nil {
-			t.Fatalf("Read response error: %v", err)
-		}
-
-		resp := string(buf[:n])
-		if resp != "mock_response_from_neng_primary\n" {
-			t.Errorf("Unexpected response: %q", resp)
-		}
-
-		select {
-		case data := <-dataChan:
-			if data != "neng_primary:"+req {
-				t.Errorf("Backend got unexpected data: %q", data)
-			}
-		case <-time.After(1 * time.Second):
-			t.Errorf("Timeout waiting for backend data")
-		}
-	})
-
-	t.Run("Failover to Agent B (Priority 2) when Agent A goes offline", func(t *testing.T) {
-		// Stop Agent A
-		cancelAgentA()
-
-		// Wait for socket closure propagation
-		time.Sleep(200 * time.Millisecond)
-
-		// Clean up its connections in the server manager
-		tm.CleanDeadTunnels()
-
-		conn, err := net.Dial("tcp", minerServerAddr)
-		if err != nil {
-			t.Fatalf("Dial miner port error: %v", err)
-		}
-		defer conn.Close()
-
-		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
-		_, _ = conn.Write([]byte(req))
-
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		if err != nil {
-			t.Fatalf("Read response error: %v", err)
-		}
-
-		resp := string(buf[:n])
-		if resp != "mock_response_from_neng_backup\n" {
-			t.Errorf("Unexpected response: %q", resp)
-		}
-
-		select {
-		case data := <-dataChan:
-			if data != "neng_backup:"+req {
-				t.Errorf("Backend got unexpected data: %q", data)
-			}
-		case <-time.After(1 * time.Second):
-			t.Errorf("Timeout waiting for backend data")
-		}
-	})
-
-	t.Run("Recover and check failback cooldown holds on backup first, then falls back to primary", func(t *testing.T) {
-		// 1. Restart Agent A (Priority 1)
-		agentA2Context, cancelAgentA2 := context.WithCancel(ctx)
-		defer cancelAgentA2()
-		startSimulatedAgent(agentA2Context, t, tunnelServerAddr, "group_neng", 1, poolNeng1Addr, 3, "", false)
-
-		// Wait for registration
-		time.Sleep(300 * time.Millisecond)
-
-		// 2. Dial miner. Since we are within the 1s cooldown (from the previous failover),
-		// this connection MUST still route to Agent B (Priority 2) even though Agent A is online.
-		conn1, err := net.Dial("tcp", minerServerAddr)
-		if err != nil {
-			t.Fatalf("Dial miner port error: %v", err)
-		}
-		req1 := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
-		_, _ = conn1.Write([]byte(req1))
-
-		buf1 := make([]byte, 1024)
-		n1, err := conn1.Read(buf1)
-		if err != nil {
-			t.Fatalf("Read response error: %v", err)
-		}
-		resp1 := string(buf1[:n1])
-		if resp1 != "mock_response_from_neng_backup\n" {
-			t.Errorf("Expected connection to hold on backup due to active cooldown, but got: %q", resp1)
-		}
-		conn1.Close()
-
-		// Read data from queue
-		select {
-		case data := <-dataChan:
-			if data != "neng_backup:"+req1 {
-				t.Errorf("Backend got unexpected data during cooldown: %q", data)
-			}
-		case <-time.After(1 * time.Second):
-			t.Errorf("Timeout waiting for backend data")
-		}
-
-		// 3. Wait for the cooldown to expire (total > 1 second since failover)
-		time.Sleep(1 * time.Second)
-
-		// 4. Dial miner again. Cooldown has expired, so it must route back to Agent A (Priority 1).
-		conn2, err := net.Dial("tcp", minerServerAddr)
-		if err != nil {
-			t.Fatalf("Dial miner port error: %v", err)
-		}
-		defer conn2.Close()
-
-		req2 := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
-		_, _ = conn2.Write([]byte(req2))
-
-		buf2 := make([]byte, 1024)
-		n2, err := conn2.Read(buf2)
-		if err != nil {
-			t.Fatalf("Read response error: %v", err)
-		}
-		resp2 := string(buf2[:n2])
-		if resp2 != "mock_response_from_neng_primary\n" {
-			t.Errorf("Expected connection to recover back to primary after cooldown, but got: %q", resp2)
-		}
-
-		select {
-		case data := <-dataChan:
-			if data != "neng_primary:"+req2 {
-				t.Errorf("Backend got unexpected data after cooldown: %q", data)
-			}
-		case <-time.After(1 * time.Second):
-			t.Errorf("Timeout waiting for backend data")
 		}
 	})
 }
@@ -475,19 +307,14 @@ func TestHotReload(t *testing.T) {
 
 	configPath := filepath.Join(tmpDir, "backends.json")
 
-	writeConfig := func(defGroup string) {
+	writeConfig := func(maxConns int) {
 		cfg := Config{
-			Listen:       "127.0.0.1:0",
-			TunnelListen: "127.0.0.1:0",
-			DefaultGroup: defGroup,
+			TunnelListen:   "127.0.0.1:0",
+			MaxConnections: maxConns,
 			Groups: []Group{
 				{
-					Name:  "group_neng",
-					Coins: []string{"NENG"},
-				},
-				{
-					Name:  "group_nxe",
-					Coins: []string{"NXE"},
+					Name:   "group_neng",
+					Listen: "127.0.0.1:30100",
 				},
 			},
 		}
@@ -500,7 +327,7 @@ func TestHotReload(t *testing.T) {
 		}
 	}
 
-	writeConfig("group_neng")
+	writeConfig(100)
 
 	cfg, err := loadConfig(configPath)
 	if err != nil {
@@ -512,21 +339,21 @@ func TestHotReload(t *testing.T) {
 	// Watch config
 	go watchConfig(configPath, cm)
 
-	if cm.Get().DefaultGroup != "group_neng" {
-		t.Errorf("Expected default group group_neng, got %s", cm.Get().DefaultGroup)
+	if cm.Get().MaxConnections != 100 {
+		t.Errorf("Expected MaxConnections 100, got %d", cm.Get().MaxConnections)
 	}
 
 	// Sleep to guarantee a different modification timestamp on the file system
 	time.Sleep(1 * time.Second)
 
 	// Modify config
-	writeConfig("group_nxe")
+	writeConfig(200)
 
 	// Wait for reload (5s loop, wait 6s)
 	time.Sleep(6 * time.Second)
 
-	if cm.Get().DefaultGroup != "group_nxe" {
-		t.Errorf("Expected default group group_nxe after hot-reload, got %s", cm.Get().DefaultGroup)
+	if cm.Get().MaxConnections != 200 {
+		t.Errorf("Expected MaxConnections 200 after hot-reload, got %d", cm.Get().MaxConnections)
 	}
 }
 
@@ -586,14 +413,12 @@ func TestSecurityAuthentication(t *testing.T) {
 	cert := generateTestCertificate(t)
 
 	cfg := &Config{
-		Listen:       "127.0.0.1:0",
 		TunnelListen: "127.0.0.1:0",
-		DefaultGroup: "group_neng",
 		SecretToken:  "super_secret_auth_token",
 		Groups: []Group{
 			{
-				Name:  "group_neng",
-				Coins: []string{"NENG"},
+				Name:   "group_neng",
+				Listen: "127.0.0.1:0",
 			},
 		},
 	}
@@ -620,13 +445,13 @@ func TestSecurityAuthentication(t *testing.T) {
 	defer cancel()
 
 	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
-	go runMinerAcceptLoop(ctx, minerListener, cm, tm, "")
+	go runMinerAcceptLoop(ctx, minerListener, cm, tm, "group_neng")
 
 	t.Run("Agent registers successfully with correct token and TLS", func(t *testing.T) {
 		agentCtx, cancelAgent := context.WithCancel(ctx)
 		defer cancelAgent()
 
-		startSimulatedAgent(agentCtx, t, tunnelAddr, "group_neng", 1, poolAddr, 1, "super_secret_auth_token", true)
+		startSimulatedAgent(agentCtx, t, tunnelAddr, "group_neng", poolAddr, 1, "super_secret_auth_token", true)
 		time.Sleep(200 * time.Millisecond) // Wait for connection/registration
 
 		// Dial miner
@@ -655,11 +480,11 @@ func TestSecurityAuthentication(t *testing.T) {
 		agentCtx, cancelAgent := context.WithCancel(ctx)
 		defer cancelAgent()
 
-		startSimulatedAgent(agentCtx, t, tunnelAddr, "group_neng", 1, poolAddr, 1, "wrong_token", true)
+		startSimulatedAgent(agentCtx, t, tunnelAddr, "group_neng", poolAddr, 1, "wrong_token", true)
 		time.Sleep(200 * time.Millisecond)
 
 		// Verification: no idle tunnels should be registered in the TunnelManager
-		conn, _, popErr := tm.PopBest("group_neng", 1*time.Second, false)
+		conn, popErr := tm.Pop("group_neng")
 		if popErr == nil {
 			conn.Close()
 			t.Errorf("Expected tunnel to be rejected, but it was accepted by server")
@@ -671,7 +496,7 @@ func TestSecurityAuthentication(t *testing.T) {
 		defer cancelAgent()
 
 		// Attempt raw TCP dial to port with correct token
-		startSimulatedAgent(agentCtx, t, tunnelAddr, "group_neng", 1, poolAddr, 1, "super_secret_auth_token", false)
+		startSimulatedAgent(agentCtx, t, tunnelAddr, "group_neng", poolAddr, 1, "super_secret_auth_token", false)
 		time.Sleep(200 * time.Millisecond)
 
 		// Dial miner
@@ -697,236 +522,13 @@ func TestSecurityAuthentication(t *testing.T) {
 	})
 }
 
-func TestMultipleMinerPorts(t *testing.T) {
-	dataChan := make(chan string, 10)
-
-	// Start local backend pools
-	_, poolNengAddr, cleanupNeng := startMockPool(t, "pool_neng", dataChan)
-	defer cleanupNeng()
-
-	_, poolNxeAddr, cleanupNxe := startMockPool(t, "pool_nxe", dataChan)
-	defer cleanupNxe()
-
-	// Configure server with dedicated ports for both groups and no global listen
+func TestPanicRecovery(t *testing.T) {
 	cfg := &Config{
-		Listen:       "", // Global port is empty
 		TunnelListen: "127.0.0.1:0",
 		Groups: []Group{
 			{
 				Name:   "group_neng",
-				Coins:  []string{"NENG"},
-				Listen: "127.0.0.1:0", // dedicated port OS-allocated
-			},
-			{
-				Name:   "group_nxe",
-				Coins:  []string{"NXE"},
-				Listen: "127.0.0.1:0", // dedicated port OS-allocated
-			},
-		},
-	}
-
-	cm := &ConfigManager{cfg: cfg}
-	tm := NewTunnelManager()
-
-	tunnelListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to listen for tunnels: %v", err)
-	}
-	defer tunnelListener.Close()
-	tunnelServerAddr := tunnelListener.Addr().String()
-
-	// Dedicate TCP ports
-	nengMinerListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to listen for NENG miners: %v", err)
-	}
-	defer nengMinerListener.Close()
-	nengMinerAddr := nengMinerListener.Addr().String()
-
-	nxeMinerListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to listen for NXE miners: %v", err)
-	}
-	defer nxeMinerListener.Close()
-	nxeMinerAddr := nxeMinerListener.Addr().String()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Start accept loops
-	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
-	go runMinerAcceptLoop(ctx, nengMinerListener, cm, tm, "group_neng")
-	go runMinerAcceptLoop(ctx, nxeMinerListener, cm, tm, "group_nxe")
-
-	// Start Agents
-	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_neng", 1, poolNengAddr, 3, "", false)
-	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_nxe", 1, poolNxeAddr, 3, "", false)
-
-	time.Sleep(300 * time.Millisecond) // Wait for agents
-
-	t.Run("Routes to NENG group from dedicated NENG port", func(t *testing.T) {
-		conn, err := net.Dial("tcp", nengMinerAddr)
-		if err != nil {
-			t.Fatalf("Dial NENG miner port error: %v", err)
-		}
-		defer conn.Close()
-
-		// Send request without c=NENG parameter, it should still map directly
-		req := `{"method":"mining.subscribe","params":["miner1"]}`
-		_, _ = conn.Write([]byte(req))
-
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		if err != nil {
-			t.Fatalf("Read response error: %v", err)
-		}
-
-		resp := string(buf[:n])
-		if resp != "mock_response_from_pool_neng\n" {
-			t.Errorf("Unexpected response: %q", resp)
-		}
-	})
-
-	t.Run("Routes to NXE group from dedicated NXE port", func(t *testing.T) {
-		conn, err := net.Dial("tcp", nxeMinerAddr)
-		if err != nil {
-			t.Fatalf("Dial NXE miner port error: %v", err)
-		}
-		defer conn.Close()
-
-		// Send request without c=NXE parameter, it should still map directly
-		req := `{"method":"mining.subscribe","params":["miner1"]}`
-		_, _ = conn.Write([]byte(req))
-
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		if err != nil {
-			t.Fatalf("Read response error: %v", err)
-		}
-
-		resp := string(buf[:n])
-		if resp != "mock_response_from_pool_nxe\n" {
-			t.Errorf("Unexpected response: %q", resp)
-		}
-	})
-}
-
-func TestStaticMapping(t *testing.T) {
-	dataChan := make(chan string, 10)
-
-	// Start local backend pools
-	_, poolPrimaryAddr, cleanupPrimary := startMockPool(t, "pool_primary", dataChan)
-	defer cleanupPrimary()
-
-	_, poolBackupAddr, cleanupBackup := startMockPool(t, "pool_backup", dataChan)
-	defer cleanupBackup()
-
-	// Configure server with static_mapping = true for group_neng
-	cfg := &Config{
-		Listen:       "127.0.0.1:0",
-		TunnelListen: "127.0.0.1:0",
-		DefaultGroup: "group_neng",
-		Groups: []Group{
-			{
-				Name:          "group_neng",
-				Coins:         []string{"NENG"},
-				StaticMapping: true,
-			},
-		},
-	}
-
-	cm := &ConfigManager{cfg: cfg}
-	tm := NewTunnelManager()
-
-	tunnelListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to listen for tunnels: %v", err)
-	}
-	defer tunnelListener.Close()
-	tunnelServerAddr := tunnelListener.Addr().String()
-
-	minerListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to listen for miners: %v", err)
-	}
-	defer minerListener.Close()
-	minerServerAddr := minerListener.Addr().String()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
-	go runMinerAcceptLoop(ctx, minerListener, cm, tm, "")
-
-	// Start Agent A: group_neng, priority 1 (primary)
-	agentAContext, cancelAgentA := context.WithCancel(ctx)
-	startSimulatedAgent(agentAContext, t, tunnelServerAddr, "group_neng", 1, poolPrimaryAddr, 3, "", false)
-
-	// Start Agent B: group_neng, priority 2 (backup)
-	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_neng", 2, poolBackupAddr, 3, "", false)
-
-	// Wait for agents to register
-	time.Sleep(300 * time.Millisecond)
-
-	t.Run("Routes to Primary Agent (Priority 1) initially", func(t *testing.T) {
-		conn, err := net.Dial("tcp", minerServerAddr)
-		if err != nil {
-			t.Fatalf("Dial miner port error: %v", err)
-		}
-		defer conn.Close()
-
-		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
-		_, _ = conn.Write([]byte(req))
-
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		if err != nil {
-			t.Fatalf("Read response error: %v", err)
-		}
-
-		resp := string(buf[:n])
-		if resp != "mock_response_from_pool_primary\n" {
-			t.Errorf("Unexpected response: %q", resp)
-		}
-	})
-
-	t.Run("Does NOT route to Backup (Priority 2) when Primary goes offline in static mapping", func(t *testing.T) {
-		// Stop Primary Agent
-		cancelAgentA()
-		time.Sleep(200 * time.Millisecond) // Wait for connection cleanup
-		tm.CleanDeadTunnels()
-
-		// Attempt to dial miner - routing should fail / timeout because Priority 2 is ignored
-		conn, err := net.Dial("tcp", minerServerAddr)
-		if err != nil {
-			t.Fatalf("Dial miner port error: %v", err)
-		}
-		defer conn.Close()
-
-		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
-		_, _ = conn.Write([]byte(req))
-
-		// We expect the server to timeout or close the connection without sending the mock backup response,
-		// because PopBest returns error (no idle tunnels for static mapping priority)
-		// and handleMiner closes miner connection on timeout/error.
-		_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		buf := make([]byte, 1024)
-		_, err = conn.Read(buf)
-		if err == nil {
-			t.Errorf("Expected routing to fail, but read data from connection")
-		}
-	})
-}
-
-func TestPanicRecovery(t *testing.T) {
-	cfg := &Config{
-		Listen:       "127.0.0.1:0",
-		TunnelListen: "127.0.0.1:0",
-		DefaultGroup: "group_neng",
-		Groups: []Group{
-			{
-				Name:  "group_neng",
-				Coins: []string{"NENG"},
+				Listen: "127.0.0.1:0",
 			},
 		},
 	}
@@ -966,14 +568,12 @@ func TestPanicRecovery(t *testing.T) {
 
 func TestMaxConnections(t *testing.T) {
 	cfg := &Config{
-		Listen:         "127.0.0.1:0",
 		TunnelListen:   "127.0.0.1:0",
-		DefaultGroup:   "group_neng",
 		MaxConnections: 2, // set limit to 2
 		Groups: []Group{
 			{
-				Name:  "group_neng",
-				Coins: []string{"NENG"},
+				Name:   "group_neng",
+				Listen: "127.0.0.1:0",
 			},
 		},
 	}
@@ -993,7 +593,7 @@ func TestMaxConnections(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go runMinerAcceptLoop(ctx, minerListener, cm, tm, "")
+	go runMinerAcceptLoop(ctx, minerListener, cm, tm, "group_neng")
 
 	// 1. Establish 1st connection
 	conn1, err := net.Dial("tcp", minerServerAddr)
@@ -1045,4 +645,3 @@ func TestMaxConnections(t *testing.T) {
 		t.Errorf("Expected 4th connection to remain open, but write failed: %v", err)
 	}
 }
-

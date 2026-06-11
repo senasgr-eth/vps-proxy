@@ -7,9 +7,8 @@ This architecture allows a local mining pool backend situated behind a NAT or fi
 ### Key Architectural Benefits
 1. **Bypasses NAT/Firewalls**: The Agent dials outbound to the VPS. No ports need to be forwarded on your local network.
 2. **No Dynamic IP Updating Needed**: Since the Agent initiates the connection, the VPS does not need to know the backend's IP. If your local ISP reconnects and changes your dynamic IP, the agent simply reconnects to the VPS automatically.
-3. **Primary-Backup High Availability**: Tunnels register with a priority level (e.g. `1` for primary, `2` for backup). The VPS always routes incoming miner connections to the highest priority idle tunnel available.
+3. **Dedicated Port-to-Group Static Mapping**: The proxy operates strictly on dedicated miner ports. Miner connections on these ports map directly to their corresponding tunnel groups, ensuring zero packet-splitting delays or dynamic payload-scanning.
 4. **FIFO Connection Allocation**: To ensure stratum stream stability, idle connections are popped in First-In, First-Out (FIFO) order.
-5. **Dedicated Port Mapping (Optional)**: In addition to the universal miner port (which dynamically scans coin symbols), you can open dedicated listen ports per coin group. Connections on these ports map directly to the corresponding group, bypassing payload scanning entirely.
 
 ---
 
@@ -17,19 +16,23 @@ This architecture allows a local mining pool backend situated behind a NAT or fi
 
 ```mermaid
 graph TD
-    Miner[Miners] -->|Connects to VPS:33333| Server[Go Stratum Proxy Server on VPS]
+    MinerA[Miners Group A] -->|Connects to VPS:30100| Server[Go Stratum Proxy Server on VPS]
+    MinerB[Miners Group B] -->|Connects to VPS:30101| Server
     
     subgraph local_network ["Local Backend Network (Behind NAT)"]
-        AgentA[Tunnel Agent A - Priority 1] -->|Outbound dials VPS:44444| Server
-        AgentA -->|Dials local pool| PoolA[Local Pool NENG :32221]
+        AgentA[Tunnel Agent - Group A] -->|Outbound dials VPS:44444| Server
+        AgentA -->|Dials local pool| PoolA[Local Pool Group A :32221]
         
-        AgentB[Tunnel Agent B - Priority 2] -->|Outbound dials VPS:44444| Server
-        AgentB -->|Dials backup pool| PoolB[Local Backup Pool :32222]
+        AgentB[Tunnel Agent - Group B] -->|Outbound dials VPS:44444| Server
+        AgentB -->|Dials local pool| PoolB[Local Pool Group B :32222]
     end
 
     subgraph vps_routing ["VPS Server Routing"]
-        Server -->|Selects Priority 1 Tunnel| TunnelPool[Active Tunnel Pool]
-        TunnelPool -->|Pipes stream| Miner
+        Server -->|Selects Idle Tunnel for Group A| TunnelPoolA[Group A Tunnel Pool]
+        TunnelPoolA -->|Pipes stream| MinerA
+
+        Server -->|Selects Idle Tunnel for Group B| TunnelPoolB[Group B Tunnel Pool]
+        TunnelPoolB -->|Pipes stream| MinerB
     end
 ```
 
@@ -38,36 +41,30 @@ graph TD
 ## Configuration
 
 ### 1. Server Configuration (`/etc/stratum-proxy/backends.json`)
-Placed on the VPS. It configures the port for miners, the port for the agents, security settings, and coin routing groups:
+Placed on the VPS. It configures the port for agents, security settings, and static routing group listener mappings:
 
 ```json
 {
-  "listen": "0.0.0.0:33333", // Optional universal port
   "tunnel_listen": "0.0.0.0:44444",
-  "default_group": "group_neng",
-  "failback_cooldown": "8h",
   "secret_token": "a_very_long_secure_shared_token_string",
   "tls_cert": "/etc/stratum-proxy/cert.pem",
   "tls_key": "/etc/stratum-proxy/key.pem",
+  "max_connections": 10000,
   "groups": [
     {
-      "name": "group_neng",
-      "coins": ["NENG", "NXE", "MTBC"],
-      "listen": "0.0.0.0:33334", // Dedicated NENG group port
-      "static_mapping": false
+      "name": "group_scrypt",
+      "listen": "0.0.0.0:30100"
     },
     {
-      "name": "group_nxe",
-      "coins": ["BTG", "BTB", "XXX"],
-      "listen": "0.0.0.0:33335", // Dedicated NXE group port
-      "static_mapping": true
+      "name": "group_neng_lowdiff",
+      "listen": "0.0.0.0:30101"
     }
   ]
 }
 ```
 
 ### 2. Agent Configuration (`/etc/stratum-agent/agent.json`)
-Placed on the local mining pool machine. It establishes tunnel pools matching coin groups, and controls whether to connect securely over TLS:
+Placed on the local mining pool machine. It establishes tunnel pools matching coin groups, mapping them to the local backend port:
 
 ```json
 {
@@ -78,13 +75,11 @@ Placed on the local mining pool machine. It establishes tunnel pools matching co
   "tls_skip_verify": true,
   "mappings": [
     {
-      "group": "group_neng",
-      "priority": 1,
+      "group": "group_scrypt",
       "local": "127.0.0.1:32221"
     },
     {
-      "group": "group_nxe",
-      "priority": 1,
+      "group": "group_neng_lowdiff",
       "local": "127.0.0.1:32222"
     }
   ]
@@ -118,7 +113,7 @@ Once generated, make sure to point the `tls_cert` and `tls_key` fields in `backe
 ## Compilation & Verification
 
 ### Run Automated Tests
-Verifies proxy routing, priority-routing, dynamic agent reconnects, failovers, and FIFO selection:
+Verifies proxy routing, dynamic agent reconnects, FIFO selection, authentication, connection limits, and panic recovery:
 
 ```bash
 /usr/local/go/bin/go test -v ./...
@@ -146,73 +141,7 @@ For simplicity, you can use the helper script `./build.sh` to compile your binar
 
 ---
 
-
-## Deployment
-
-### A. VPS Setup (Tunnel Server)
-
-1. **Directories & Configuration**:
-   ```bash
-   sudo mkdir -p /etc/stratum-proxy
-   sudo cp backends.json /etc/stratum-proxy/
-   ```
-
-2. **Binary Installation**:
-   ```bash
-   sudo cp stratum-proxy /usr/local/bin/
-   sudo chmod +x /usr/local/bin/stratum-proxy
-   ```
-
-3. **Systemd Service Setup**:
-   ```bash
-   sudo cp stratum-proxy.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable stratum-proxy
-   sudo systemctl start stratum-proxy
-   ```
-
-4. **Monitor Server Logs**:
-   ```bash
-   sudo journalctl -u stratum-proxy -f -n 100
-   ```
-
----
-
-### B. Local Backend Setup (Tunnel Agent)
-
-1. **Directories & Configuration**:
-   ```bash
-   sudo mkdir -p /etc/stratum-agent
-   sudo cp agent/agent.json /etc/stratum-agent/agent.json
-   ```
-
-2. **Binary Installation**:
-   ```bash
-   sudo cp stratum-agent /usr/local/bin/
-   sudo chmod +x /usr/local/bin/stratum-agent
-   ```
-
-3. **Systemd Service Setup**:
-   ```bash
-   sudo cp stratum-agent.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable stratum-agent
-   sudo systemctl start stratum-agent
-   ```
-
-4. **Monitor Agent Logs**:
-   ```bash
-   sudo journalctl -u stratum-agent -f -n 100
-   ```
-
----
-
-## How Priority, FIFO, and Failback Cooldown Works
+## How Dedicated Port FIFO Mapping Works
 
 1. **FIFO Pool Mapping**: The Agent maintains a constant pool of `pool_size` idle connections to the VPS. Inside the VPS, these connections are sorted by registration time (FIFO). When a miner connects, the VPS selects the oldest idle connection in the pool. This minimizes connection cycling.
-2. **Failover Priority**: If you run a Primary Agent (with `"priority": 1` in its `agent.json`) and a Backup Agent (with `"priority": 2` in its `agent.json`), the VPS always pops from the Priority 1 pool.
-3. **Failback Cooldown**: If the Primary Agent (Priority 1) goes offline, the VPS automatically routes new connections to the Backup Agent (Priority 2), triggering a **failback cooldown** (configured via `"failback_cooldown"`, e.g. `"8h"`). 
-4. **Cooldown Hold**: During the cooldown period (default: 8 hours), even if the Primary Agent comes back online, all new connections will **continue to route to the Backup Agent**. This prevents stratum miners from constantly jumping or cutting off.
-5. **Fail-safe Logic**: If the Backup Agent goes offline during the cooldown period, the server temporarily bypasses the cooldown lock to route new connections to the Primary Agent, keeping miners online.
-6. **Auto-Recovery**: Once the cooldown duration expires, new connections will naturally fall back to the Primary Agent (Priority 1) again.
-7. **Static Mapping**: If `"static_mapping": true` is configured on a coin group, automatic failover is completely disabled. Miner connections will strictly route to the Primary Agent (Priority 1). If the Primary Agent is offline, the connection will fail immediately and will NOT fall back to Priority 2. This is useful when the backup stratum backend does not support the same coins as the primary backend.
+2. **Dedicated Port Constraints**: There is no universal port scanning stratum packets. Dedicated ports map strictly to one group. This guarantees that miners connecting on a port are directly piped to the specific local backend pool registered under that group, eliminating any packet routing errors.

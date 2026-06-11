@@ -12,27 +12,18 @@
   // Set to true to bypass standard SSL certificate validation (useful for self-signed certificates)
   "tls_skip_verify": true,
 
-  // Set to true to use raw unencrypted TCP tunnels. This should only be used for testing,
-  // or if proxying traffic inside a secure local network.
-  "insecure": false,
+  // Set to true to use TLS encryption for the tunnels. If false, raw TCP is used.
+  "tls": true,
 
   // Mapping of VPS coin groups to your local backend pools
   "mappings": [
     {
-      "group": "group_neng",
-
-      // Priority level of this agent for the group:
-      // - Priority 1: Primary backend pool.
-      // - Priority 2: Backup backend pool.
-      // The VPS server will always route miners to Priority 1 if available.
-      "priority": 1,
-
+      "group": "group_scrypt",
       // Address of the local mining pool instance running on this backend machine
       "local": "127.0.0.1:32221"
     },
     {
-      "group": "group_nxe",
-      "priority": 1,
+      "group": "group_neng_lowdiff",
       "local": "127.0.0.1:32222"
     }
   ]

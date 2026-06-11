@@ -13,9 +13,8 @@ import (
 )
 
 type Mapping struct {
-	Group    string `json:"group"`
-	Priority int    `json:"priority"`
-	Local    string `json:"local"`
+	Group string `json:"group"`
+	Local string `json:"local"`
 }
 
 type Config struct {
@@ -78,8 +77,8 @@ func main() {
 }
 
 func maintainTunnelPool(cfg Config, mapping Mapping) {
-	log.Printf("[PoolManager] Starting pool for group %s (priority: %d, local pool: %s)",
-		mapping.Group, mapping.Priority, mapping.Local)
+	log.Printf("[PoolManager] Starting pool for group %s (local pool: %s)",
+		mapping.Group, mapping.Local)
 
 	slots := make(chan struct{}, cfg.PoolSize)
 	for i := 0; i < cfg.PoolSize; i++ {
@@ -134,12 +133,12 @@ func runTunnelSession(cfg Config, mapping Mapping) {
 		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
 	}
 
-	// 2. Send registration header: "REG <group> <priority> <token>\n" or "REG <group> <priority>\n"
+	// 2. Send registration header: "REG <group> <token>\n" or "REG <group>\n"
 	var regHeader string
 	if cfg.SecretToken != "" {
-		regHeader = fmt.Sprintf("REG %s %d %s\n", mapping.Group, mapping.Priority, cfg.SecretToken)
+		regHeader = fmt.Sprintf("REG %s %s\n", mapping.Group, cfg.SecretToken)
 	} else {
-		regHeader = fmt.Sprintf("REG %s %d\n", mapping.Group, mapping.Priority)
+		regHeader = fmt.Sprintf("REG %s\n", mapping.Group)
 	}
 
 	_ = vpsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))

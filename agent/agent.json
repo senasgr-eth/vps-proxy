@@ -7,12 +7,10 @@
   "mappings": [
     {
       "group": "group_neng",
-      "priority": 1,
       "local": "127.0.0.1:32221"
     },
     {
       "group": "group_nxe",
-      "priority": 1,
       "local": "127.0.0.1:32222"
     }
   ]

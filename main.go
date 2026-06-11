@@ -21,22 +21,17 @@ import (
 )
 
 type Group struct {
-	Name          string   `json:"name"`
-	Coins         []string `json:"coins"`
-	StaticMapping bool     `json:"static_mapping"`
-	Listen        string   `json:"listen"`
+	Name   string `json:"name"`
+	Listen string `json:"listen"`
 }
 
 type Config struct {
-	Listen           string  `json:"listen"`
-	TunnelListen     string  `json:"tunnel_listen"`
-	DefaultGroup     string  `json:"default_group"`
-	FailbackCooldown string  `json:"failback_cooldown"`
-	SecretToken      string  `json:"secret_token"`
-	TLSCert          string  `json:"tls_cert"`
-	TLSKey           string  `json:"tls_key"`
-	Groups           []Group `json:"groups"`
-	MaxConnections   int     `json:"max_connections"`
+	TunnelListen   string  `json:"tunnel_listen"`
+	SecretToken    string  `json:"secret_token"`
+	TLSCert        string  `json:"tls_cert"`
+	TLSKey         string  `json:"tls_key"`
+	Groups         []Group `json:"groups"`
+	MaxConnections int     `json:"max_connections"`
 }
 
 type ConfigManager struct {
@@ -77,17 +72,6 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("decode JSON error: %w", err)
 	}
 
-	hasAnyListen := cfg.Listen != ""
-	for i := range cfg.Groups {
-		if cfg.Groups[i].Listen != "" {
-			hasAnyListen = true
-			break
-		}
-	}
-	if !hasAnyListen {
-		return nil, errors.New("neither global listen nor any group-specific listen addresses configured")
-	}
-
 	if cfg.TunnelListen == "" {
 		return nil, errors.New("tunnel_listen address is empty")
 	}
@@ -101,6 +85,9 @@ func loadConfig(path string) (*Config, error) {
 		if g.Name == "" {
 			return nil, fmt.Errorf("group at index %d has empty name", i)
 		}
+		if g.Listen == "" {
+			return nil, fmt.Errorf("group %s does not specify a dedicated listen address", g.Name)
+		}
 	}
 
 	if cfg.MaxConnections <= 0 {
@@ -110,30 +97,22 @@ func loadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-
 // Tunnel represents an idle connection from a Tunnel Agent.
 type Tunnel struct {
-	conn     net.Conn
-	group    string
-	priority int
-	addedAt  time.Time
-}
-
-type GroupState struct {
-	LastFailoverTime time.Time
+	conn    net.Conn
+	group   string
+	addedAt time.Time
 }
 
 // TunnelManager coordinates idle tunnel connections thread-safely.
 type TunnelManager struct {
-	mu         sync.Mutex
-	tunnels    map[string][]*Tunnel
-	groupState map[string]*GroupState
+	mu      sync.Mutex
+	tunnels map[string][]*Tunnel
 }
 
 func NewTunnelManager() *TunnelManager {
 	return &TunnelManager{
-		tunnels:    make(map[string][]*Tunnel),
-		groupState: make(map[string]*GroupState),
+		tunnels: make(map[string][]*Tunnel),
 	}
 }
 
@@ -141,8 +120,8 @@ func (tm *TunnelManager) Add(t *Tunnel) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.tunnels[t.group] = append(tm.tunnels[t.group], t)
-	log.Printf("[TunnelManager] Registered tunnel for group %s (priority: %d, active for group: %d)",
-		t.group, t.priority, len(tm.tunnels[t.group]))
+	log.Printf("[TunnelManager] Registered tunnel for group %s (active for group: %d)",
+		t.group, len(tm.tunnels[t.group]))
 }
 
 // CleanDeadTunnels checks all idle tunnels and removes closed connections.
@@ -174,101 +153,20 @@ func (tm *TunnelManager) CleanDeadTunnels() {
 	}
 }
 
-// PopBest pops the highest priority (lowest integer value) idle tunnel for the given group.
-// If multiple tunnels have the same priority, selects the oldest (FIFO).
-// If in cooldown, prefers backup tunnels (priority > 1) over primary tunnels (priority 1).
-// If staticMapping is true, ignores backup tunnels (priority > 1) and disables failover.
-func (tm *TunnelManager) PopBest(group string, cooldownDuration time.Duration, staticMapping bool) (net.Conn, int, error) {
+// Pop pops the oldest idle tunnel for the given group (FIFO).
+func (tm *TunnelManager) Pop(group string) (net.Conn, error) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	list, exists := tm.tunnels[group]
 	if !exists || len(list) == 0 {
-		return nil, 0, errors.New("no idle tunnels available")
+		return nil, errors.New("no idle tunnels available")
 	}
 
-	state, ok := tm.groupState[group]
-	if !ok {
-		state = &GroupState{}
-		tm.groupState[group] = state
-	}
+	bestTunnel := list[0]
+	tm.tunnels[group] = list[1:]
 
-	inCooldown := false
-	if !staticMapping && !state.LastFailoverTime.IsZero() && time.Since(state.LastFailoverTime) < cooldownDuration {
-		inCooldown = true
-	}
-
-	// Group tunnels by priority
-	byPriority := make(map[int][]*Tunnel)
-	minPriorityAvailable := 999999
-	for _, t := range list {
-		if staticMapping && t.priority > 1 {
-			// In static mapping mode, we strictly ignore backup agents (priority > 1)
-			continue
-		}
-		byPriority[t.priority] = append(byPriority[t.priority], t)
-		if t.priority < minPriorityAvailable {
-			minPriorityAvailable = t.priority
-		}
-	}
-
-	if len(byPriority) == 0 {
-		return nil, 0, errors.New("no idle tunnels available for static mapping priority")
-	}
-
-	var selectedPriority int
-
-	if inCooldown {
-		// Prefer backups (priority > 1) during cooldown.
-		// Find lowest backup priority number (e.g. 2 is preferred over 3)
-		bestBackupPriority := 999999
-		for p := range byPriority {
-			if p > 1 && p < bestBackupPriority {
-				bestBackupPriority = p
-			}
-		}
-
-		if bestBackupPriority != 999999 {
-			selectedPriority = bestBackupPriority
-		} else {
-			// No backups online, break cooldown and use primary
-			selectedPriority = minPriorityAvailable
-		}
-	} else {
-		// Normal mode (or static mapping): prefer highest priority (lowest integer, e.g. Priority 1)
-		selectedPriority = minPriorityAvailable
-	}
-
-	// Filter for candidate tunnels matching selectedPriority
-	var candidateIdx = -1
-	var oldestTime time.Time
-
-	for i, t := range list {
-		if t.priority == selectedPriority {
-			if candidateIdx == -1 || t.addedAt.Before(oldestTime) {
-				candidateIdx = i
-				oldestTime = t.addedAt
-			}
-		}
-	}
-
-	if candidateIdx == -1 {
-		return nil, 0, errors.New("no matching priority tunnel found")
-	}
-
-	bestTunnel := list[candidateIdx]
-
-	// Detect failover transition (Normal mode -> switching to backup)
-	if !staticMapping && !inCooldown && selectedPriority > 1 {
-		state.LastFailoverTime = time.Now()
-		log.Printf("[TunnelManager] Failover detected for group %s. Switched to backup (priority %d). Locked on backup for %v.",
-			group, selectedPriority, cooldownDuration)
-	}
-
-	// Remove from slice
-	tm.tunnels[group] = append(list[:candidateIdx], list[candidateIdx+1:]...)
-
-	return bestTunnel.conn, bestTunnel.priority, nil
+	return bestTunnel.conn, nil
 }
 
 // CountedWriter wraps an io.Writer and atomically increments a byte counter on success.
@@ -368,27 +266,15 @@ func main() {
 
 	var minerListeners []net.Listener
 
-	// Start global miner acceptance port if configured
-	if cfg.Listen != "" {
-		minerListener, err := net.Listen("tcp", cfg.Listen)
-		if err != nil {
-			log.Fatalf("Fatal error starting global miner listener on %s: %v", cfg.Listen, err)
-		}
-		minerListeners = append(minerListeners, minerListener)
-		log.Printf("Listening for Miners on global TCP %s", cfg.Listen)
-	}
-
-	// Start dedicated miner acceptance ports per group if configured
+	// Start dedicated miner acceptance ports per group
 	for i := range cfg.Groups {
 		g := &cfg.Groups[i]
-		if g.Listen != "" {
-			listener, err := net.Listen("tcp", g.Listen)
-			if err != nil {
-				log.Fatalf("Fatal error starting dedicated miner listener on %s for group %s: %v", g.Listen, g.Name, err)
-			}
-			minerListeners = append(minerListeners, listener)
-			log.Printf("Listening for Dedicated Miners on TCP %s for group %s", g.Listen, g.Name)
+		listener, err := net.Listen("tcp", g.Listen)
+		if err != nil {
+			log.Fatalf("Fatal error starting dedicated miner listener on %s for group %s: %v", g.Listen, g.Name, err)
 		}
+		minerListeners = append(minerListeners, listener)
+		log.Printf("Listening for Dedicated Miners on TCP %s for group %s", g.Listen, g.Name)
 	}
 
 	// Graceful shutdown setup
@@ -412,24 +298,13 @@ func main() {
 		runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
 	})
 
-	idx := 0
-	if cfg.Listen != "" {
-		ml := minerListeners[idx]
-		safeGo("minerAcceptLoop_global", func() {
-			runMinerAcceptLoop(ctx, ml, cm, tm, "")
-		})
-		idx++
-	}
 	for i := range cfg.Groups {
 		g := &cfg.Groups[i]
-		if g.Listen != "" {
-			ml := minerListeners[idx]
-			groupName := g.Name
-			safeGo("minerAcceptLoop_"+groupName, func() {
-				runMinerAcceptLoop(ctx, ml, cm, tm, groupName)
-			})
-			idx++
-		}
+		ml := minerListeners[i]
+		groupName := g.Name
+		safeGo("minerAcceptLoop_"+groupName, func() {
+			runMinerAcceptLoop(ctx, ml, cm, tm, groupName)
+		})
 	}
 
 	// Block main thread until context is done (graceful shutdown)
@@ -471,8 +346,8 @@ func watchConfig(path string, cm *ConfigManager) {
 			}
 
 			oldCfg := cm.Get()
-			if oldCfg.Listen != newCfg.Listen || oldCfg.TunnelListen != newCfg.TunnelListen {
-				log.Printf("WARNING: Listen/TunnelListen addresses changed in config, but this requires a manual restart to take effect.")
+			if oldCfg.TunnelListen != newCfg.TunnelListen {
+				log.Printf("WARNING: TunnelListen address changed in config, but this requires a manual restart to take effect.")
 			}
 
 			cm.Set(newCfg, newCert)
@@ -572,7 +447,7 @@ func handleTunnelRegistration(conn net.Conn, tm *TunnelManager, cm *ConfigManage
 		}
 	}
 
-	// Read registration line: "REG <group_name> <priority>\n" or "REG <group_name> <priority> <token>\n"
+	// Read registration line: "REG <group_name> <token>\n" or "REG <group_name>\n"
 	_ = wrappedConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var line []byte
 	buf := make([]byte, 1)
@@ -600,13 +475,13 @@ func handleTunnelRegistration(conn net.Conn, tm *TunnelManager, cm *ConfigManage
 	parts := strings.Fields(strings.TrimSpace(string(line)))
 	cfg := cm.Get()
 
-	// If secret_token is configured on server, registration must have 4 parts: "REG <group> <priority> <token>"
-	// Otherwise, it has 3 parts: "REG <group> <priority>"
+	// If secret_token is configured on server, registration must have 3 parts: "REG <group> <token>"
+	// Otherwise, it has 2 parts: "REG <group>"
 	var expectedParts int
 	if cfg.SecretToken != "" {
-		expectedParts = 4
-	} else {
 		expectedParts = 3
+	} else {
+		expectedParts = 2
 	}
 
 	if len(parts) != expectedParts || parts[0] != "REG" {
@@ -616,16 +491,9 @@ func handleTunnelRegistration(conn net.Conn, tm *TunnelManager, cm *ConfigManage
 	}
 
 	groupName := parts[1]
-	var priority int
-	_, err := fmt.Sscanf(parts[2], "%d", &priority)
-	if err != nil {
-		log.Printf("[%s] Invalid tunnel registration priority: %q", clientAddr, parts[2])
-		_ = wrappedConn.Close()
-		return
-	}
 
 	if cfg.SecretToken != "" {
-		token := parts[3]
+		token := parts[2]
 		if subtle.ConstantTimeCompare([]byte(token), []byte(cfg.SecretToken)) != 1 {
 			log.Printf("[%s] Tunnel registration failed: invalid secret token", clientAddr)
 			_ = wrappedConn.Close()
@@ -634,16 +502,14 @@ func handleTunnelRegistration(conn net.Conn, tm *TunnelManager, cm *ConfigManage
 	}
 
 	t := &Tunnel{
-		conn:     wrappedConn,
-		group:    groupName,
-		priority: priority,
-		addedAt:  time.Now(),
+		conn:    wrappedConn,
+		group:   groupName,
+		addedAt: time.Now(),
 	}
 	tm.Add(t)
 }
 
-
-func runMinerAcceptLoop(ctx context.Context, listener net.Listener, cm *ConfigManager, tm *TunnelManager, overrideGroupName string) {
+func runMinerAcceptLoop(ctx context.Context, listener net.Listener, cm *ConfigManager, tm *TunnelManager, groupName string) {
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
@@ -670,13 +536,13 @@ func runMinerAcceptLoop(ctx context.Context, listener net.Listener, cm *ConfigMa
 		tracked := &TrackedConn{Conn: clientConn}
 
 		safeGo("minerConn_"+clientConn.RemoteAddr().String(), func() {
-			handleMiner(tracked, cm, tm, overrideGroupName)
+			handleMiner(tracked, cm, tm, groupName)
 		})
 	}
 }
 
-func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, overrideGroupName string) {
-	if overrideGroupName == "panic_trigger_for_test" {
+func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, groupName string) {
+	if groupName == "panic_trigger_for_test" {
 		panic("simulated test panic")
 	}
 	clientAddr := clientConn.RemoteAddr().String()
@@ -698,69 +564,30 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, over
 	firstChunk = firstChunk[:n]
 	_ = clientConn.SetReadDeadline(time.Time{})
 
-	// 2. Scan for coin symbol or use override
-	payloadStr := string(firstChunk)
+	// 2. Map directly to groupName.
 	cfg := cm.Get()
 	var matchedGroup *Group
-	var matchedCoin string
-
-	if overrideGroupName != "" {
-		for i := range cfg.Groups {
-			if cfg.Groups[i].Name == overrideGroupName {
-				matchedGroup = &cfg.Groups[i]
-				break
-			}
-		}
-	} else {
-		for i := range cfg.Groups {
-			g := &cfg.Groups[i]
-			for _, coin := range g.Coins {
-				tag := "c=" + coin
-				if strings.Contains(strings.ToLower(payloadStr), strings.ToLower(tag)) {
-					matchedGroup = g
-					matchedCoin = coin
-					break
-				}
-			}
-			if matchedGroup != nil {
-				break
-			}
-		}
-
-		// 3. Fallback to default group
-		if matchedGroup == nil {
-			for i := range cfg.Groups {
-				if cfg.Groups[i].Name == cfg.DefaultGroup {
-					matchedGroup = &cfg.Groups[i]
-					break
-				}
-			}
+	for i := range cfg.Groups {
+		if cfg.Groups[i].Name == groupName {
+			matchedGroup = &cfg.Groups[i]
+			break
 		}
 	}
 
 	if matchedGroup == nil {
-		log.Printf("[%s] No matching group or default group found for payload %q", clientAddr, strings.TrimSpace(payloadStr))
+		log.Printf("[%s] No matching group %q found in configuration", clientAddr, groupName)
 		_ = clientConn.Close()
 		return
 	}
 
-	// 4. Pop the best tunnel and write the first chunk.
+	// 3. Pop a tunnel and write the first chunk.
 	// We wait up to 3 seconds for a tunnel connection to become available.
 	var tunnelConn net.Conn
-	var tunnelPriority int
 	var popErr error
 	startWait := time.Now()
 
-	// Parse cooldown duration
-	cooldown := 8 * time.Hour
-	if cfg.FailbackCooldown != "" {
-		if d, err := time.ParseDuration(cfg.FailbackCooldown); err == nil {
-			cooldown = d
-		}
-	}
-
 	for {
-		tunnelConn, tunnelPriority, popErr = tm.PopBest(matchedGroup.Name, cooldown, matchedGroup.StaticMapping)
+		tunnelConn, popErr = tm.Pop(matchedGroup.Name)
 		if popErr == nil {
 			// Test the tunnel connection by writing the first chunk
 			_, err = tunnelConn.Write(firstChunk)
@@ -787,13 +614,9 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, over
 		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
 	}
 
-	if matchedCoin != "" {
-		log.Printf("[%s] Routed to priority %d tunnel for group %s (coin: c=%s)", clientAddr, tunnelPriority, matchedGroup.Name, matchedCoin)
-	} else {
-		log.Printf("[%s] Routed to priority %d tunnel for group %s (default fallback)", clientAddr, tunnelPriority, matchedGroup.Name)
-	}
+	log.Printf("[%s] Routed to tunnel for group %s", clientAddr, matchedGroup.Name)
 
-	// 5. Pipe connection bidirectionally
+	// 4. Pipe connection bidirectionally
 	var bytesSent int64 = int64(len(firstChunk))
 	var bytesReceived int64
 	startTime := time.Now()
@@ -817,6 +640,6 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, over
 	<-done
 
 	duration := time.Since(startTime)
-	log.Printf("[%s] Connection closed. Group: %s | Priority: %d | Duration: %s | Bytes Sent (Client->Tunnel): %d | Bytes Rcvd (Tunnel->Client): %d",
-		clientAddr, matchedGroup.Name, tunnelPriority, duration.Truncate(time.Second), atomic.LoadInt64(&bytesSent), atomic.LoadInt64(&bytesReceived))
+	log.Printf("[%s] Connection closed. Group: %s | Duration: %s | Bytes Sent (Client->Tunnel): %d | Bytes Rcvd (Tunnel->Client): %d",
+		clientAddr, matchedGroup.Name, duration.Truncate(time.Second), atomic.LoadInt64(&bytesSent), atomic.LoadInt64(&bytesReceived))
 }

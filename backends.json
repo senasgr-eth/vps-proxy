@@ -1,19 +1,16 @@
 {
-  "listen": "0.0.0.0:33333",
   "tunnel_listen": "0.0.0.0:44444",
-  "default_group": "group_neng",
-  "failback_cooldown": "8h",
   "secret_token": "a_very_long_secure_shared_token_string",
   "tls_cert": "cert.pem",
   "tls_key": "key.pem",
   "groups": [
     {
       "name": "group_neng",
-      "coins": ["NENG", "NXE", "MTBC"]
+      "listen": "0.0.0.0:30100"
     },
     {
       "name": "group_nxe",
-      "coins": ["BTG", "BTB", "XXX"]
+      "listen": "0.0.0.0:30101"
     }
   ]
 }

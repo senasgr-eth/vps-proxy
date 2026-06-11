@@ -1,17 +1,6 @@
 {
-  // Port where miners connect (Stratum mining client) - OPTIONAL if at least one group has a dedicated listen port
-  "listen": "0.0.0.0:33333",
-
   // Port where Tunnel Agents connect from behind the NAT
   "tunnel_listen": "0.0.0.0:44444",
-
-  // Default coin group if a miner connection does not send a matching coin symbol
-  "default_group": "group_neng",
-
-  // Cooldown duration to lock connections onto backup agents after a failover.
-  // Set to prevent miners from connection cutoff/jumping.
-  // Accepts duration formats like "8h", "30m", or "2h30m".
-  "failback_cooldown": "8h",
 
   // Shared secret token to authorize agents (sent securely over TLS)
   "secret_token": "a_very_long_secure_shared_token_string",
@@ -20,22 +9,19 @@
   "tls_cert": "/etc/stratum-proxy/cert.pem",
   "tls_key": "/etc/stratum-proxy/key.pem",
 
-  // Mining coin routing groups
+  // Maximum concurrent miner/tunnel connections allowed across the proxy
+  "max_connections": 10000,
+
+  // Mining backend groups and their dedicated ports.
+  // Miner clients connect directly to these dedicated ports.
   "groups": [
     {
-      "name": "group_neng",
-      "coins": ["NENG", "NXE", "MTBC"],
-      // Optional: Dedicated port for NENG miners. Bypasses coin scanning and maps directly to group_neng.
-      "listen": "0.0.0.0:33334",
-      // Set to true to disable automatic failover to backups for this group.
-      // Useful if backends support only specific coins and must not receive others.
-      "static_mapping": false
+      "name": "group_scrypt",
+      "listen": "0.0.0.0:30100"
     },
     {
-      "name": "group_nxe",
-      "coins": ["BTG", "BTB", "XXX"],
-      "listen": "0.0.0.0:33335",
-      "static_mapping": true
+      "name": "group_neng_lowdiff",
+      "listen": "0.0.0.0:30101"
     }
   ]
 }

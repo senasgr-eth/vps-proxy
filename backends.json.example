@@ -1,4 +1,9 @@
 {
+  // Optional: Global port where all miners connect.
+  // The proxy scans incoming payloads on this port for coin symbols ("c=coin")
+  // and routes statically to the matched group (fails if unrecognized or offline).
+  "listen": "0.0.0.0:33333",
+
   // Port where Tunnel Agents connect from behind the NAT
   "tunnel_listen": "0.0.0.0:44444",
 
@@ -12,16 +17,19 @@
   // Maximum concurrent miner/tunnel connections allowed across the proxy
   "max_connections": 10000,
 
-  // Mining backend groups and their dedicated ports.
-  // Miner clients connect directly to these dedicated ports.
+  // Mining backend groups configuration.
   "groups": [
     {
       "name": "group_scrypt",
-      "listen": "0.0.0.0:30100"
+      // Optional: Dedicated port for this group (bypasses payload scanning entirely)
+      "listen": "0.0.0.0:30100",
+      // List of coin symbols supported by this group (used for global port matching)
+      "coins": ["NENG", "LTC", "DGB"]
     },
     {
       "name": "group_neng_lowdiff",
-      "listen": "0.0.0.0:30101"
+      "listen": "0.0.0.0:30101",
+      "coins": ["NENG_LOW"]
     }
   ]
 }

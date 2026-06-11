@@ -7,7 +7,9 @@ This architecture allows a local mining pool backend situated behind a NAT or fi
 ### Key Architectural Benefits
 1. **Bypasses NAT/Firewalls**: The Agent dials outbound to the VPS. No ports need to be forwarded on your local network.
 2. **No Dynamic IP Updating Needed**: Since the Agent initiates the connection, the VPS does not need to know the backend's IP. If your local ISP reconnects and changes your dynamic IP, the agent simply reconnects to the VPS automatically.
-3. **Dedicated Port-to-Group Static Mapping**: The proxy operates strictly on dedicated miner ports. Miner connections on these ports map directly to their corresponding tunnel groups, ensuring zero packet-splitting delays or dynamic payload-scanning.
+3. **Flexible Static Routing Options**:
+   - **Global Port (Coin Scanning)**: Expose a single port (e.g. `33333`) on the VPS. The proxy scans incoming payloads on this port for coin symbols (like `c=NENG` or `c=NXE`) and routes statically to the matched group. If unrecognized or offline, it drops the connection immediately (no failover/fallback).
+   - **Dedicated Port Mapping (Bypass Scanning)**: Open dedicated listen ports per group (e.g. `30100`). Connections on these ports map directly to their corresponding tunnel groups, ensuring zero packet-splitting delays or dynamic payload-scanning.
 4. **FIFO Connection Allocation**: To ensure stratum stream stability, idle connections are popped in First-In, First-Out (FIFO) order.
 
 ---
@@ -16,23 +18,24 @@ This architecture allows a local mining pool backend situated behind a NAT or fi
 
 ```mermaid
 graph TD
-    MinerA[Miners Group A] -->|Connects to VPS:30100| Server[Go Stratum Proxy Server on VPS]
-    MinerB[Miners Group B] -->|Connects to VPS:30101| Server
+    MinerGlobal1[Miner NENG] -->|Connects to VPS:33333| Server[Go Stratum Proxy Server on VPS]
+    MinerGlobal2[Miner NXE] -->|Connects to VPS:33333| Server
+    MinerScrypt[Miner Dedicated Scrypt] -->|Connects to VPS:30100| Server
     
     subgraph local_network ["Local Backend Network (Behind NAT)"]
-        AgentA[Tunnel Agent - Group A] -->|Outbound dials VPS:44444| Server
-        AgentA -->|Dials local pool| PoolA[Local Pool Group A :32221]
+        AgentA[Tunnel Agent - Group Scrypt] -->|Outbound dials VPS:44444| Server
+        AgentA -->|Dials local pool| PoolA[Local Pool Scrypt :32221]
         
-        AgentB[Tunnel Agent - Group B] -->|Outbound dials VPS:44444| Server
-        AgentB -->|Dials local pool| PoolB[Local Pool Group B :32222]
+        AgentB[Tunnel Agent - Group NXE] -->|Outbound dials VPS:44444| Server
+        AgentB -->|Dials local pool| PoolB[Local Pool NXE :32222]
     end
 
     subgraph vps_routing ["VPS Server Routing"]
-        Server -->|Selects Idle Tunnel for Group A| TunnelPoolA[Group A Tunnel Pool]
-        TunnelPoolA -->|Pipes stream| MinerA
+        Server -->|Scans c=NENG or maps VPS:30100| TunnelPoolA[Group Scrypt Tunnel Pool]
+        TunnelPoolA -->|Pipes stream| MinerGlobal1
 
-        Server -->|Selects Idle Tunnel for Group B| TunnelPoolB[Group B Tunnel Pool]
-        TunnelPoolB -->|Pipes stream| MinerB
+        Server -->|Scans c=NXE| TunnelPoolB[Group NXE Tunnel Pool]
+        TunnelPoolB -->|Pipes stream| MinerGlobal2
     end
 ```
 
@@ -41,10 +44,11 @@ graph TD
 ## Configuration
 
 ### 1. Server Configuration (`/etc/stratum-proxy/backends.json`)
-Placed on the VPS. It configures the port for agents, security settings, and static routing group listener mappings:
+Placed on the VPS. It configures the ports, security settings, and static routing group configurations:
 
 ```json
 {
+  "listen": "0.0.0.0:33333", // Optional global port
   "tunnel_listen": "0.0.0.0:44444",
   "secret_token": "a_very_long_secure_shared_token_string",
   "tls_cert": "/etc/stratum-proxy/cert.pem",
@@ -53,11 +57,13 @@ Placed on the VPS. It configures the port for agents, security settings, and sta
   "groups": [
     {
       "name": "group_scrypt",
-      "listen": "0.0.0.0:30100"
+      "listen": "0.0.0.0:30100", // Optional dedicated port
+      "coins": ["NENG", "LTC", "MTBC"] // Coin symbols for global port matching
     },
     {
-      "name": "group_neng_lowdiff",
-      "listen": "0.0.0.0:30101"
+      "name": "group_nxe",
+      "listen": "0.0.0.0:30101",
+      "coins": ["NXE", "BTG"]
     }
   ]
 }
@@ -79,7 +85,7 @@ Placed on the local mining pool machine. It establishes tunnel pools matching co
       "local": "127.0.0.1:32221"
     },
     {
-      "group": "group_neng_lowdiff",
+      "group": "group_nxe",
       "local": "127.0.0.1:32222"
     }
   ]
@@ -141,7 +147,8 @@ For simplicity, you can use the helper script `./build.sh` to compile your binar
 
 ---
 
-## How Dedicated Port FIFO Mapping Works
+## How Static Mapping & FIFO Works
 
 1. **FIFO Pool Mapping**: The Agent maintains a constant pool of `pool_size` idle connections to the VPS. Inside the VPS, these connections are sorted by registration time (FIFO). When a miner connects, the VPS selects the oldest idle connection in the pool. This minimizes connection cycling.
-2. **Dedicated Port Constraints**: There is no universal port scanning stratum packets. Dedicated ports map strictly to one group. This guarantees that miners connecting on a port are directly piped to the specific local backend pool registered under that group, eliminating any packet routing errors.
+2. **Zero Failover / Cooldown**: There are no failover mechanisms, secondary fallback agents, or cooldown periods. If a miner matches a group (either via a dedicated port or by scanning `c=coin` on the global port), it is mapped statically. If that group has no active tunnel connections from an agent, the connection is dropped immediately.
+3. **Verbose Log Troubleshooting**: If a miner fails to route on the global port, the proxy prints a verbose log showing the full incoming Stratum payload string (up to 1024 bytes) to help troubleshoot missing or misplaced coin symbols.

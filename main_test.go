@@ -189,6 +189,125 @@ func startSimulatedAgent(ctx context.Context, t *testing.T, serverAddr, group st
 		}
 	}()
 }
+func TestGlobalPortRouting(t *testing.T) {
+	dataChan := make(chan string, 10)
+
+	// Start local backend pools
+	_, poolNengAddr, cleanupNeng := startMockPool(t, "pool_neng", dataChan)
+	defer cleanupNeng()
+
+	_, poolNxeAddr, cleanupNxe := startMockPool(t, "pool_nxe", dataChan)
+	defer cleanupNxe()
+
+	// Configure server with global port and coin lists
+	cfg := &Config{
+		Listen:       "127.0.0.1:0",
+		TunnelListen: "127.0.0.1:0",
+		Groups: []Group{
+			{
+				Name:  "group_neng",
+				Coins: []string{"NENG", "LTC"},
+			},
+			{
+				Name:  "group_nxe",
+				Coins: []string{"NXE", "BTG"},
+			},
+		},
+	}
+
+	cm := &ConfigManager{cfg: cfg}
+	tm := NewTunnelManager()
+
+	tunnelListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen for tunnels: %v", err)
+	}
+	defer tunnelListener.Close()
+	tunnelServerAddr := tunnelListener.Addr().String()
+
+	globalMinerListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen for global miners: %v", err)
+	}
+	defer globalMinerListener.Close()
+	globalMinerAddr := globalMinerListener.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start accept loops
+	go runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
+	go runMinerAcceptLoop(ctx, globalMinerListener, cm, tm, "") // Empty groupName triggers coin scanning
+
+	// Start Agents
+	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_neng", poolNengAddr, 3, "", false)
+	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_nxe", poolNxeAddr, 3, "", false)
+
+	time.Sleep(300 * time.Millisecond) // Wait for agents
+
+	t.Run("Routes to NENG group from global port (matched NENG symbol)", func(t *testing.T) {
+		conn, err := net.Dial("tcp", globalMinerAddr)
+		if err != nil {
+			t.Fatalf("Dial global miner port error: %v", err)
+		}
+		defer conn.Close()
+
+		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
+		_, _ = conn.Write([]byte(req))
+
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("Read response error: %v", err)
+		}
+
+		resp := string(buf[:n])
+		if resp != "mock_response_from_pool_neng\n" {
+			t.Errorf("Unexpected response: %q", resp)
+		}
+	})
+
+	t.Run("Routes to NXE group from global port (matched NXE symbol)", func(t *testing.T) {
+		conn, err := net.Dial("tcp", globalMinerAddr)
+		if err != nil {
+			t.Fatalf("Dial global miner port error: %v", err)
+		}
+		defer conn.Close()
+
+		req := `{"method":"mining.subscribe","params":["miner1","c=NXE"]}`
+		_, _ = conn.Write([]byte(req))
+
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("Read response error: %v", err)
+		}
+
+		resp := string(buf[:n])
+		if resp != "mock_response_from_pool_nxe\n" {
+			t.Errorf("Unexpected response: %q", resp)
+		}
+	})
+
+	t.Run("Fails to route on unrecognized coin symbol", func(t *testing.T) {
+		conn, err := net.Dial("tcp", globalMinerAddr)
+		if err != nil {
+			t.Fatalf("Dial global miner port error: %v", err)
+		}
+		defer conn.Close()
+
+		req := `{"method":"mining.subscribe","params":["miner1","c=INVALID"]}`
+		_, _ = conn.Write([]byte(req))
+
+		// Connection should be closed by proxy
+		_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		buf := make([]byte, 1024)
+		_, err = conn.Read(buf)
+		if err == nil {
+			t.Errorf("Expected connection to be closed, but read succeeded")
+		}
+	})
+}
 
 func TestMultipleMinerPorts(t *testing.T) {
 	dataChan := make(chan string, 10)

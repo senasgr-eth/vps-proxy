@@ -21,11 +21,13 @@ import (
 )
 
 type Group struct {
-	Name   string `json:"name"`
-	Listen string `json:"listen"`
+	Name   string   `json:"name"`
+	Listen string   `json:"listen"`
+	Coins  []string `json:"coins"`
 }
 
 type Config struct {
+	Listen         string  `json:"listen"`
 	TunnelListen   string  `json:"tunnel_listen"`
 	SecretToken    string  `json:"secret_token"`
 	TLSCert        string  `json:"tls_cert"`
@@ -85,8 +87,8 @@ func loadConfig(path string) (*Config, error) {
 		if g.Name == "" {
 			return nil, fmt.Errorf("group at index %d has empty name", i)
 		}
-		if g.Listen == "" {
-			return nil, fmt.Errorf("group %s does not specify a dedicated listen address", g.Name)
+		if cfg.Listen == "" && g.Listen == "" {
+			return nil, fmt.Errorf("group %s does not specify a dedicated listen address, and no global listen address is configured", g.Name)
 		}
 	}
 
@@ -265,17 +267,7 @@ func main() {
 	}
 
 	var minerListeners []net.Listener
-
-	// Start dedicated miner acceptance ports per group
-	for i := range cfg.Groups {
-		g := &cfg.Groups[i]
-		listener, err := net.Listen("tcp", g.Listen)
-		if err != nil {
-			log.Fatalf("Fatal error starting dedicated miner listener on %s for group %s: %v", g.Listen, g.Name, err)
-		}
-		minerListeners = append(minerListeners, listener)
-		log.Printf("Listening for Dedicated Miners on TCP %s for group %s", g.Listen, g.Name)
-	}
+	var globalListener net.Listener
 
 	// Graceful shutdown setup
 	ctx, cancel := context.WithCancel(context.Background())
@@ -288,24 +280,51 @@ func main() {
 		log.Printf("Received signal %s, shutting down...", sig)
 		cancel()
 		_ = tunnelListener.Close()
+		if globalListener != nil {
+			_ = globalListener.Close()
+		}
 		for _, ml := range minerListeners {
 			_ = ml.Close()
 		}
 	})
 
-	// Run acceptance loops
+	// Start global miner listener if configured
+	if cfg.Listen != "" {
+		l, err := net.Listen("tcp", cfg.Listen)
+		if err != nil {
+			log.Fatalf("Fatal error starting global miner listener on %s: %v", cfg.Listen, err)
+		}
+		globalListener = l
+		log.Printf("Listening for Global Miners on TCP %s (dynamic routing by coin symbol)", cfg.Listen)
+
+		safeGo("minerAcceptLoop_global", func() {
+			runMinerAcceptLoop(ctx, globalListener, cm, tm, "")
+		})
+	}
+
+	// Start dedicated miner acceptance ports per group if configured
+	for i := range cfg.Groups {
+		g := &cfg.Groups[i]
+		if g.Listen != "" {
+			listener, err := net.Listen("tcp", g.Listen)
+			if err != nil {
+				log.Fatalf("Fatal error starting dedicated miner listener on %s for group %s: %v", g.Listen, g.Name, err)
+			}
+			minerListeners = append(minerListeners, listener)
+			log.Printf("Listening for Dedicated Miners on TCP %s for group %s", g.Listen, g.Name)
+
+			groupName := g.Name
+			ml := listener
+			safeGo("minerAcceptLoop_"+groupName, func() {
+				runMinerAcceptLoop(ctx, ml, cm, tm, groupName)
+			})
+		}
+	}
+
+	// Run tunnel acceptance loop
 	safeGo("tunnelAcceptLoop", func() {
 		runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
 	})
-
-	for i := range cfg.Groups {
-		g := &cfg.Groups[i]
-		ml := minerListeners[i]
-		groupName := g.Name
-		safeGo("minerAcceptLoop_"+groupName, func() {
-			runMinerAcceptLoop(ctx, ml, cm, tm, groupName)
-		})
-	}
 
 	// Block main thread until context is done (graceful shutdown)
 	<-ctx.Done()
@@ -552,9 +571,9 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
 	}
 
-	// 1. Read first packet (up to 512 bytes) with 5 seconds timeout
+	// 1. Read first packet (up to 1024 bytes) with 5 seconds timeout
 	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	firstChunk := make([]byte, 512)
+	firstChunk := make([]byte, 1024)
 	n, err := clientConn.Read(firstChunk)
 	if err != nil {
 		log.Printf("[%s] Error reading first packet from miner: %v", clientAddr, err)
@@ -564,18 +583,40 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 	firstChunk = firstChunk[:n]
 	_ = clientConn.SetReadDeadline(time.Time{})
 
-	// 2. Map directly to groupName.
+	// 2. Map connection to backend group
+	payloadStr := string(firstChunk)
 	cfg := cm.Get()
 	var matchedGroup *Group
-	for i := range cfg.Groups {
-		if cfg.Groups[i].Name == groupName {
-			matchedGroup = &cfg.Groups[i]
-			break
+	var matchedCoin string
+
+	if groupName != "" {
+		// Strictly map to groupName if connection came through dedicated port
+		for i := range cfg.Groups {
+			if cfg.Groups[i].Name == groupName {
+				matchedGroup = &cfg.Groups[i]
+				break
+			}
+		}
+	} else {
+		// Scan payload for coin symbol (c=coin) to map to intended backend group
+		for i := range cfg.Groups {
+			g := &cfg.Groups[i]
+			for _, coin := range g.Coins {
+				tag := "c=" + coin
+				if strings.Contains(strings.ToLower(payloadStr), strings.ToLower(tag)) {
+					matchedGroup = g
+					matchedCoin = coin
+					break
+				}
+			}
+			if matchedGroup != nil {
+				break
+			}
 		}
 	}
 
 	if matchedGroup == nil {
-		log.Printf("[%s] No matching group %q found in configuration", clientAddr, groupName)
+		log.Printf("[%s] Routing failed: no matching coin symbol found in stratum payload: %q", clientAddr, payloadStr)
 		_ = clientConn.Close()
 		return
 	}
@@ -614,7 +655,11 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
 	}
 
-	log.Printf("[%s] Routed to tunnel for group %s", clientAddr, matchedGroup.Name)
+	if matchedCoin != "" {
+		log.Printf("[%s] Routed to tunnel for group %s (matched coin: %s)", clientAddr, matchedGroup.Name, matchedCoin)
+	} else {
+		log.Printf("[%s] Routed to tunnel for group %s", clientAddr, matchedGroup.Name)
+	}
 
 	// 4. Pipe connection bidirectionally
 	var bytesSent int64 = int64(len(firstChunk))

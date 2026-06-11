@@ -570,29 +570,41 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 		_ = tcpConn.SetKeepAlive(true)
 		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
 	}
-	// 1. Read first packet line (up to newline '\n' or max 2048 bytes) with 5 seconds timeout.
-	// This ensures we get the full JSON frame and handles packet splitting.
-	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var firstChunk []byte
-	buf := make([]byte, 1)
-	for {
-		n, err := clientConn.Read(buf)
+
+	if groupName != "" {
+		// For dedicated ports, we don't need to buffer for inspection.
+		// Read the first chunk normally to keep latency at 0.
+		_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		firstChunk = make([]byte, 1024)
+		n, err := clientConn.Read(firstChunk)
 		if err != nil {
 			log.Printf("[%s] Error reading first packet from miner: %v", clientAddr, err)
 			_ = clientConn.Close()
 			return
 		}
-		if n > 0 {
-			firstChunk = append(firstChunk, buf[0])
-			if buf[0] == '\n' {
+		firstChunk = firstChunk[:n]
+		_ = clientConn.SetReadDeadline(time.Time{})
+	} else {
+		// For the global port, buffer miner data for up to 300ms (inspect-delay)
+		// to capture all initial packets (subscribe + authorize) before scanning.
+		_ = clientConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		buf := make([]byte, 256)
+		for {
+			n, err := clientConn.Read(buf)
+			if n > 0 {
+				firstChunk = append(firstChunk, buf[:n]...)
+			}
+			if err != nil {
+				// Stop on timeout or connection close
+				break
+			}
+			if len(firstChunk) >= 2048 {
 				break
 			}
 		}
-		if len(firstChunk) >= 2048 {
-			break
-		}
+		_ = clientConn.SetReadDeadline(time.Time{})
 	}
-	_ = clientConn.SetReadDeadline(time.Time{})
 
 	// 2. Map connection to backend group
 	payloadStr := string(firstChunk)

@@ -570,17 +570,28 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 		_ = tcpConn.SetKeepAlive(true)
 		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
 	}
-
-	// 1. Read first packet (up to 1024 bytes) with 5 seconds timeout
+	// 1. Read first packet line (up to newline '\n' or max 2048 bytes) with 5 seconds timeout.
+	// This ensures we get the full JSON frame and handles packet splitting.
 	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	firstChunk := make([]byte, 1024)
-	n, err := clientConn.Read(firstChunk)
-	if err != nil {
-		log.Printf("[%s] Error reading first packet from miner: %v", clientAddr, err)
-		_ = clientConn.Close()
-		return
+	var firstChunk []byte
+	buf := make([]byte, 1)
+	for {
+		n, err := clientConn.Read(buf)
+		if err != nil {
+			log.Printf("[%s] Error reading first packet from miner: %v", clientAddr, err)
+			_ = clientConn.Close()
+			return
+		}
+		if n > 0 {
+			firstChunk = append(firstChunk, buf[0])
+			if buf[0] == '\n' {
+				break
+			}
+		}
+		if len(firstChunk) >= 2048 {
+			break
+		}
 	}
-	firstChunk = firstChunk[:n]
 	_ = clientConn.SetReadDeadline(time.Time{})
 
 	// 2. Map connection to backend group
@@ -598,18 +609,39 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 			}
 		}
 	} else {
-		// Scan payload for coin symbol (c=coin) to map to intended backend group
+		// Scan payload for coin symbol (c=coin) to map to intended backend group.
+		// To prevent substring collisions (e.g. "c=NENG_LOW" matching "c=NENG"),
+		// we match against all configured coins sorted by their symbol length in descending order.
+		type coinMatch struct {
+			symbol string
+			group  *Group
+		}
+		var matches []coinMatch
 		for i := range cfg.Groups {
 			g := &cfg.Groups[i]
 			for _, coin := range g.Coins {
-				tag := "c=" + coin
-				if strings.Contains(strings.ToLower(payloadStr), strings.ToLower(tag)) {
-					matchedGroup = g
-					matchedCoin = coin
-					break
+				matches = append(matches, coinMatch{
+					symbol: coin,
+					group:  g,
+				})
+			}
+		}
+
+		// Sort by symbol length descending
+		for i := 0; i < len(matches)-1; i++ {
+			for j := i + 1; j < len(matches); j++ {
+				if len(matches[i].symbol) < len(matches[j].symbol) {
+					matches[i], matches[j] = matches[j], matches[i]
 				}
 			}
-			if matchedGroup != nil {
+		}
+
+		payloadLower := strings.ToLower(payloadStr)
+		for _, m := range matches {
+			tag := "c=" + strings.ToLower(m.symbol)
+			if strings.Contains(payloadLower, tag) {
+				matchedGroup = m.group
+				matchedCoin = m.symbol
 				break
 			}
 		}
@@ -631,8 +663,8 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 		tunnelConn, popErr = tm.Pop(matchedGroup.Name)
 		if popErr == nil {
 			// Test the tunnel connection by writing the first chunk
-			_, err = tunnelConn.Write(firstChunk)
-			if err == nil {
+			_, writeErr := tunnelConn.Write(firstChunk)
+			if writeErr == nil {
 				// Successfully bound to this tunnel!
 				break
 			}

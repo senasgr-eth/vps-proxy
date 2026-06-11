@@ -196,6 +196,9 @@ func TestGlobalPortRouting(t *testing.T) {
 	_, poolNengAddr, cleanupNeng := startMockPool(t, "pool_neng", dataChan)
 	defer cleanupNeng()
 
+	_, poolNengLowAddr, cleanupNengLow := startMockPool(t, "pool_neng_low", dataChan)
+	defer cleanupNengLow()
+
 	_, poolNxeAddr, cleanupNxe := startMockPool(t, "pool_nxe", dataChan)
 	defer cleanupNxe()
 
@@ -207,6 +210,10 @@ func TestGlobalPortRouting(t *testing.T) {
 			{
 				Name:  "group_neng",
 				Coins: []string{"NENG", "LTC"},
+			},
+			{
+				Name:  "group_neng_lowdiff",
+				Coins: []string{"NENG_LOW"},
 			},
 			{
 				Name:  "group_nxe",
@@ -241,6 +248,7 @@ func TestGlobalPortRouting(t *testing.T) {
 
 	// Start Agents
 	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_neng", poolNengAddr, 3, "", false)
+	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_neng_lowdiff", poolNengLowAddr, 3, "", false)
 	startSimulatedAgent(ctx, t, tunnelServerAddr, "group_nxe", poolNxeAddr, 3, "", false)
 
 	time.Sleep(300 * time.Millisecond) // Wait for agents
@@ -252,7 +260,7 @@ func TestGlobalPortRouting(t *testing.T) {
 		}
 		defer conn.Close()
 
-		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
+		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}` + "\n"
 		_, _ = conn.Write([]byte(req))
 
 		buf := make([]byte, 1024)
@@ -267,6 +275,50 @@ func TestGlobalPortRouting(t *testing.T) {
 		}
 	})
 
+	t.Run("Routes to NENG group with casing variations (matched c=nEnG)", func(t *testing.T) {
+		conn, err := net.Dial("tcp", globalMinerAddr)
+		if err != nil {
+			t.Fatalf("Dial global miner port error: %v", err)
+		}
+		defer conn.Close()
+
+		req := `{"method":"mining.subscribe","params":["miner1","c=nEnG"]}` + "\n"
+		_, _ = conn.Write([]byte(req))
+
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("Read response error: %v", err)
+		}
+
+		resp := string(buf[:n])
+		if resp != "mock_response_from_pool_neng\n" {
+			t.Errorf("Unexpected response: %q", resp)
+		}
+	})
+
+	t.Run("Routes to NENG_LOW group without collision (matched c=NENG_LOW)", func(t *testing.T) {
+		conn, err := net.Dial("tcp", globalMinerAddr)
+		if err != nil {
+			t.Fatalf("Dial global miner port error: %v", err)
+		}
+		defer conn.Close()
+
+		req := `{"method":"mining.subscribe","params":["miner1","c=NENG_LOW"]}` + "\n"
+		_, _ = conn.Write([]byte(req))
+
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("Read response error: %v", err)
+		}
+
+		resp := string(buf[:n])
+		if resp != "mock_response_from_pool_neng_low\n" {
+			t.Errorf("Unexpected response: %q", resp)
+		}
+	})
+
 	t.Run("Routes to NXE group from global port (matched NXE symbol)", func(t *testing.T) {
 		conn, err := net.Dial("tcp", globalMinerAddr)
 		if err != nil {
@@ -274,7 +326,7 @@ func TestGlobalPortRouting(t *testing.T) {
 		}
 		defer conn.Close()
 
-		req := `{"method":"mining.subscribe","params":["miner1","c=NXE"]}`
+		req := `{"method":"mining.subscribe","params":["miner1","c=NXE"]}` + "\n"
 		_, _ = conn.Write([]byte(req))
 
 		buf := make([]byte, 1024)
@@ -296,7 +348,7 @@ func TestGlobalPortRouting(t *testing.T) {
 		}
 		defer conn.Close()
 
-		req := `{"method":"mining.subscribe","params":["miner1","c=INVALID"]}`
+		req := `{"method":"mining.subscribe","params":["miner1","c=INVALID"]}` + "\n"
 		_, _ = conn.Write([]byte(req))
 
 		// Connection should be closed by proxy
@@ -379,7 +431,7 @@ func TestMultipleMinerPorts(t *testing.T) {
 		}
 		defer conn.Close()
 
-		req := `{"method":"mining.subscribe","params":["miner1"]}`
+		req := `{"method":"mining.subscribe","params":["miner1"]}` + "\n"
 		_, _ = conn.Write([]byte(req))
 
 		buf := make([]byte, 1024)
@@ -401,7 +453,7 @@ func TestMultipleMinerPorts(t *testing.T) {
 		}
 		defer conn.Close()
 
-		req := `{"method":"mining.subscribe","params":["miner1"]}`
+		req := `{"method":"mining.subscribe","params":["miner1"]}` + "\n"
 		_, _ = conn.Write([]byte(req))
 
 		buf := make([]byte, 1024)
@@ -580,7 +632,7 @@ func TestSecurityAuthentication(t *testing.T) {
 		}
 		defer conn.Close()
 
-		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
+		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}` + "\n"
 		_, _ = conn.Write([]byte(req))
 
 		buf := make([]byte, 1024)
@@ -625,7 +677,7 @@ func TestSecurityAuthentication(t *testing.T) {
 		}
 		defer conn.Close()
 
-		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}`
+		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}` + "\n"
 		_, _ = conn.Write([]byte(req))
 
 		buf := make([]byte, 1024)

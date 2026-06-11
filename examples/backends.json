@@ -1,0 +1,17 @@
+{
+  "tunnel_listen": "0.0.0.0:44444",
+  "secret_token": "a_very_long_secure_shared_token_string",
+  "tls_cert": "/etc/stratum-proxy/cert.pem",
+  "tls_key": "/etc/stratum-proxy/key.pem",
+  "max_connections": 10000,
+  "groups": [
+    {
+      "name": "group_scrypt",
+      "listen": "0.0.0.0:30100"
+    },
+    {
+      "name": "group_neng_lowdiff",
+      "listen": "0.0.0.0:30101"
+    }
+  ]
+}

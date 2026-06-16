@@ -607,10 +607,12 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 	var tunnelConn net.Conn
 	var popErr error
 	startWait := time.Now()
+	proxyHeader := proxyProtoHeader(clientConn)
 	for {
 		tunnelConn, popErr = tm.Pop(matchedGroup.Name)
 		if popErr == nil {
-			_, writeErr := tunnelConn.Write(firstChunk)
+			payload := append(proxyHeader, firstChunk...)
+			_, writeErr := tunnelConn.Write(payload)
 			if writeErr == nil {
 				break
 			}
@@ -655,6 +657,21 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 	duration := time.Since(startTime)
 	log.Printf("[%s] Connection closed. Group: %s | Duration: %s | Bytes Sent (Client->Tunnel): %d | Bytes Rcvd (Tunnel->Client): %d",
 		clientAddr, matchedGroup.Name, duration.Truncate(time.Second), atomic.LoadInt64(&bytesSent), atomic.LoadInt64(&bytesReceived))
+}
+
+// proxyProtoHeader builds a HAProxy PROXY protocol v1 header from the miner connection.
+// Format: "PROXY TCP4 <client_ip> <server_ip> <client_port> <server_port>\r\n"
+func proxyProtoHeader(clientConn net.Conn) []byte {
+	clientIP, clientPort, err1 := net.SplitHostPort(clientConn.RemoteAddr().String())
+	serverIP, serverPort, err2 := net.SplitHostPort(clientConn.LocalAddr().String())
+	if err1 != nil || err2 != nil {
+		return nil
+	}
+	proto := "TCP4"
+	if strings.Contains(clientIP, ":") {
+		proto = "TCP6"
+	}
+	return []byte(fmt.Sprintf("PROXY %s %s %s %s %s\r\n", proto, clientIP, serverIP, clientPort, serverPort))
 }
 
 // findCoinInText scans text for "c=COIN" patterns and returns the matching group.
@@ -805,8 +822,18 @@ func routeByProtocol(clientAddr string, clientConn net.Conn, cm *ConfigManager, 
 		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
 	}
 
-	// Replay buffered messages (subscribe + any extras + authorize) to backend.
+	// Replay buffered messages (subscribe + any extras + authorize) to backend,
+	// preceded by a PROXY protocol header so the pool sees the real miner IP.
 	var bytesSent int64
+	if header := proxyProtoHeader(clientConn); len(header) > 0 {
+		if _, wErr := tunnelConn.Write(header); wErr != nil {
+			log.Printf("[%s] Failed writing PROXY protocol header: %v", clientAddr, wErr)
+			_ = tunnelConn.Close()
+			_ = clientConn.Close()
+			return
+		}
+		bytesSent += int64(len(header))
+	}
 	for _, bl := range bufferedLines {
 		if _, wErr := tunnelConn.Write(bl); wErr != nil {
 			log.Printf("[%s] Failed replaying to tunnel: %v", clientAddr, wErr)

@@ -253,89 +253,83 @@ func TestGlobalPortRouting(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond) // Wait for agents
 
-	t.Run("Routes to NENG group from global port (matched NENG symbol)", func(t *testing.T) {
+	// stratumDial performs the full stateful stratum handshake against the global port:
+	// 1. Send mining.subscribe → read and discard fake subscribe response from proxy.
+	// 2. Send mining.authorize with coin in password → read real backend response.
+	// Returns the backend response string (or error).
+	stratumDial := func(t *testing.T, coin string) (string, error) {
+		t.Helper()
 		conn, err := net.Dial("tcp", globalMinerAddr)
 		if err != nil {
-			t.Fatalf("Dial global miner port error: %v", err)
+			return "", fmt.Errorf("dial error: %w", err)
 		}
 		defer conn.Close()
 
-		req := `{"method":"mining.subscribe","params":["miner1","c=NENG"]}` + "\n"
-		_, _ = conn.Write([]byte(req))
+		// Step 1: subscribe
+		subscribe := `{"id":1,"method":"mining.subscribe","params":["miner/1.0"]}` + "\n"
+		if _, err := conn.Write([]byte(subscribe)); err != nil {
+			return "", fmt.Errorf("write subscribe error: %w", err)
+		}
 
+		// Step 2: read fake subscribe response from proxy
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		fakeBuf := make([]byte, 512)
+		if _, err := conn.Read(fakeBuf); err != nil {
+			return "", fmt.Errorf("read fake subscribe response error: %w", err)
+		}
+
+		// Step 3: authorize with coin in password (-p c=COIN)
+		password := "c=" + coin
+		authorize := fmt.Sprintf(`{"id":2,"method":"mining.authorize","params":["wallet","%s"]}`+"\n", password)
+		if _, err := conn.Write([]byte(authorize)); err != nil {
+			return "", fmt.Errorf("write authorize error: %w", err)
+		}
+
+		// Step 4: read backend response forwarded by proxy
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		buf := make([]byte, 1024)
 		n, err := conn.Read(buf)
 		if err != nil {
-			t.Fatalf("Read response error: %v", err)
+			return "", fmt.Errorf("read response error: %w", err)
 		}
+		return string(buf[:n]), nil
+	}
 
-		resp := string(buf[:n])
+	t.Run("Routes to NENG group from global port (matched c=NENG)", func(t *testing.T) {
+		resp, err := stratumDial(t, "NENG")
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
 		if resp != "mock_response_from_pool_neng\n" {
 			t.Errorf("Unexpected response: %q", resp)
 		}
 	})
 
 	t.Run("Routes to NENG group with casing variations (matched c=nEnG)", func(t *testing.T) {
-		conn, err := net.Dial("tcp", globalMinerAddr)
+		resp, err := stratumDial(t, "nEnG")
 		if err != nil {
-			t.Fatalf("Dial global miner port error: %v", err)
+			t.Fatalf("%v", err)
 		}
-		defer conn.Close()
-
-		req := `{"method":"mining.subscribe","params":["miner1","c=nEnG"]}` + "\n"
-		_, _ = conn.Write([]byte(req))
-
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		if err != nil {
-			t.Fatalf("Read response error: %v", err)
-		}
-
-		resp := string(buf[:n])
 		if resp != "mock_response_from_pool_neng\n" {
 			t.Errorf("Unexpected response: %q", resp)
 		}
 	})
 
 	t.Run("Routes to NENG_LOW group without collision (matched c=NENG_LOW)", func(t *testing.T) {
-		conn, err := net.Dial("tcp", globalMinerAddr)
+		resp, err := stratumDial(t, "NENG_LOW")
 		if err != nil {
-			t.Fatalf("Dial global miner port error: %v", err)
+			t.Fatalf("%v", err)
 		}
-		defer conn.Close()
-
-		req := `{"method":"mining.subscribe","params":["miner1","c=NENG_LOW"]}` + "\n"
-		_, _ = conn.Write([]byte(req))
-
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		if err != nil {
-			t.Fatalf("Read response error: %v", err)
-		}
-
-		resp := string(buf[:n])
 		if resp != "mock_response_from_pool_neng_low\n" {
 			t.Errorf("Unexpected response: %q", resp)
 		}
 	})
 
-	t.Run("Routes to NXE group from global port (matched NXE symbol)", func(t *testing.T) {
-		conn, err := net.Dial("tcp", globalMinerAddr)
+	t.Run("Routes to NXE group from global port (matched c=NXE)", func(t *testing.T) {
+		resp, err := stratumDial(t, "NXE")
 		if err != nil {
-			t.Fatalf("Dial global miner port error: %v", err)
+			t.Fatalf("%v", err)
 		}
-		defer conn.Close()
-
-		req := `{"method":"mining.subscribe","params":["miner1","c=NXE"]}` + "\n"
-		_, _ = conn.Write([]byte(req))
-
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		if err != nil {
-			t.Fatalf("Read response error: %v", err)
-		}
-
-		resp := string(buf[:n])
 		if resp != "mock_response_from_pool_nxe\n" {
 			t.Errorf("Unexpected response: %q", resp)
 		}
@@ -348,11 +342,19 @@ func TestGlobalPortRouting(t *testing.T) {
 		}
 		defer conn.Close()
 
-		req := `{"method":"mining.subscribe","params":["miner1","c=INVALID"]}` + "\n"
-		_, _ = conn.Write([]byte(req))
+		// Send subscribe → read fake response → send authorize with invalid coin
+		subscribe := `{"id":1,"method":"mining.subscribe","params":["miner/1.0"]}` + "\n"
+		_, _ = conn.Write([]byte(subscribe))
 
-		// Connection should be closed by proxy
-		_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		fakeBuf := make([]byte, 512)
+		_, _ = conn.Read(fakeBuf)
+
+		authorize := `{"id":2,"method":"mining.authorize","params":["wallet","c=INVALID"]}` + "\n"
+		_, _ = conn.Write([]byte(authorize))
+
+		// Proxy should close the connection when no coin matches
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		buf := make([]byte, 1024)
 		_, err = conn.Read(buf)
 		if err == nil {

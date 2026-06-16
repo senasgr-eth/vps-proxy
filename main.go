@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/subtle"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -570,127 +572,57 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 		_ = tcpConn.SetKeepAlive(true)
 		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
 	}
-	var firstChunk []byte
 
-	if groupName != "" {
-		// For dedicated ports, we don't need to buffer for inspection.
-		// Read the first chunk normally to keep latency at 0.
-		_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		firstChunk = make([]byte, 1024)
-		n, err := clientConn.Read(firstChunk)
-		if err != nil {
-			log.Printf("[%s] Error reading first packet from miner: %v", clientAddr, err)
-			_ = clientConn.Close()
-			return
-		}
-		firstChunk = firstChunk[:n]
-		_ = clientConn.SetReadDeadline(time.Time{})
-	} else {
-		// For the global port, buffer miner data for up to 300ms (inspect-delay)
-		// to capture all initial packets (subscribe + authorize) before scanning.
-		_ = clientConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-		buf := make([]byte, 256)
-		for {
-			n, err := clientConn.Read(buf)
-			if n > 0 {
-				firstChunk = append(firstChunk, buf[:n]...)
-			}
-			if err != nil {
-				// Stop on timeout or connection close
-				break
-			}
-			if len(firstChunk) >= 2048 {
-				break
-			}
-		}
-		_ = clientConn.SetReadDeadline(time.Time{})
+	if groupName == "" {
+		routeByProtocol(clientAddr, clientConn, cm, tm)
+		return
 	}
 
-	// 2. Map connection to backend group
-	payloadStr := string(firstChunk)
+	// Dedicated port: read first chunk and forward to matching group tunnel.
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	firstChunk := make([]byte, 1024)
+	n, err := clientConn.Read(firstChunk)
+	if err != nil {
+		log.Printf("[%s] Error reading first packet from miner: %v", clientAddr, err)
+		_ = clientConn.Close()
+		return
+	}
+	firstChunk = firstChunk[:n]
+	_ = clientConn.SetReadDeadline(time.Time{})
+
 	cfg := cm.Get()
 	var matchedGroup *Group
-	var matchedCoin string
-
-	if groupName != "" {
-		// Strictly map to groupName if connection came through dedicated port
-		for i := range cfg.Groups {
-			if cfg.Groups[i].Name == groupName {
-				matchedGroup = &cfg.Groups[i]
-				break
-			}
-		}
-	} else {
-		// Scan payload for coin symbol (c=coin) to map to intended backend group.
-		// To prevent substring collisions (e.g. "c=NENG_LOW" matching "c=NENG"),
-		// we match against all configured coins sorted by their symbol length in descending order.
-		type coinMatch struct {
-			symbol string
-			group  *Group
-		}
-		var matches []coinMatch
-		for i := range cfg.Groups {
-			g := &cfg.Groups[i]
-			for _, coin := range g.Coins {
-				matches = append(matches, coinMatch{
-					symbol: coin,
-					group:  g,
-				})
-			}
-		}
-
-		// Sort by symbol length descending
-		for i := 0; i < len(matches)-1; i++ {
-			for j := i + 1; j < len(matches); j++ {
-				if len(matches[i].symbol) < len(matches[j].symbol) {
-					matches[i], matches[j] = matches[j], matches[i]
-				}
-			}
-		}
-
-		payloadLower := strings.ToLower(payloadStr)
-		for _, m := range matches {
-			tag := "c=" + strings.ToLower(m.symbol)
-			if strings.Contains(payloadLower, tag) {
-				matchedGroup = m.group
-				matchedCoin = m.symbol
-				break
-			}
+	for i := range cfg.Groups {
+		if cfg.Groups[i].Name == groupName {
+			matchedGroup = &cfg.Groups[i]
+			break
 		}
 	}
-
 	if matchedGroup == nil {
-		log.Printf("[%s] Routing failed: no matching coin symbol found in stratum payload: %q", clientAddr, payloadStr)
+		log.Printf("[%s] Routing failed: group %s not found in config", clientAddr, groupName)
 		_ = clientConn.Close()
 		return
 	}
 
-	// 3. Pop a tunnel and write the first chunk.
-	// We wait up to 3 seconds for a tunnel connection to become available.
 	var tunnelConn net.Conn
 	var popErr error
 	startWait := time.Now()
-
 	for {
 		tunnelConn, popErr = tm.Pop(matchedGroup.Name)
 		if popErr == nil {
-			// Test the tunnel connection by writing the first chunk
 			_, writeErr := tunnelConn.Write(firstChunk)
 			if writeErr == nil {
-				// Successfully bound to this tunnel!
 				break
 			}
 			log.Printf("[%s] Popped tunnel was dead/closed, discarding and retrying...", clientAddr)
 			_ = tunnelConn.Close()
 			continue
 		}
-
 		if time.Since(startWait) > 3*time.Second {
 			log.Printf("[%s] Routing failed: timeout waiting for tunnel in group %s: %v", clientAddr, matchedGroup.Name, popErr)
 			_ = clientConn.Close()
 			return
 		}
-
 		time.Sleep(100 * time.Millisecond)
 	}
 
@@ -699,20 +631,13 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
 	}
 
-	if matchedCoin != "" {
-		log.Printf("[%s] Routed to tunnel for group %s (matched coin: %s)", clientAddr, matchedGroup.Name, matchedCoin)
-	} else {
-		log.Printf("[%s] Routed to tunnel for group %s", clientAddr, matchedGroup.Name)
-	}
+	log.Printf("[%s] Routed to tunnel for group %s", clientAddr, matchedGroup.Name)
 
-	// 4. Pipe connection bidirectionally
 	var bytesSent int64 = int64(len(firstChunk))
 	var bytesReceived int64
 	startTime := time.Now()
-
 	done := make(chan struct{}, 1)
 
-	// Client -> Tunnel
 	safeGo("pipe_client_to_tunnel_"+clientAddr, func() {
 		cw := CountedWriter{w: tunnelConn, c: &bytesSent}
 		_, _ = io.Copy(cw, clientConn)
@@ -721,7 +646,6 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 		done <- struct{}{}
 	})
 
-	// Tunnel -> Client
 	cw := CountedWriter{w: clientConn, c: &bytesReceived}
 	_, _ = io.Copy(cw, tunnelConn)
 	_ = clientConn.Close()
@@ -731,4 +655,242 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 	duration := time.Since(startTime)
 	log.Printf("[%s] Connection closed. Group: %s | Duration: %s | Bytes Sent (Client->Tunnel): %d | Bytes Rcvd (Tunnel->Client): %d",
 		clientAddr, matchedGroup.Name, duration.Truncate(time.Second), atomic.LoadInt64(&bytesSent), atomic.LoadInt64(&bytesReceived))
+}
+
+// findCoinInText scans text for "c=COIN" patterns and returns the matching group.
+// Matches longest symbol first to avoid substring collisions (e.g. NENG_LOW vs NENG).
+func findCoinInText(text string, cfg *Config) (*Group, string) {
+	textLower := strings.ToLower(text)
+
+	type entry struct {
+		symbol string
+		group  *Group
+	}
+	var entries []entry
+	for i := range cfg.Groups {
+		g := &cfg.Groups[i]
+		for _, coin := range g.Coins {
+			entries = append(entries, entry{coin, g})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return len(entries[i].symbol) > len(entries[j].symbol)
+	})
+
+	for _, e := range entries {
+		tag := "c=" + strings.ToLower(e.symbol)
+		if strings.Contains(textLower, tag) {
+			return e.group, e.symbol
+		}
+	}
+	return nil, ""
+}
+
+// routeByProtocol handles global port connections using stateful stratum inspection.
+//
+// Flow:
+//  1. Read miner lines until mining.authorize is seen.
+//  2. On mining.subscribe → reply with a fake subscribe response so sequential
+//     miners (those that wait for pool ack before sending authorize) proceed.
+//  3. Extract coin from mining.authorize password (e.g. "-p c=neng").
+//  4. Route to the matching backend tunnel, replay buffered messages.
+//  5. Intercept the backend's real subscribe response, convert it to
+//     mining.set_extranonce so the miner syncs its extranonce without confusion.
+//  6. Bidirectional pipe for the rest of the session.
+func routeByProtocol(clientAddr string, clientConn net.Conn, cm *ConfigManager, tm *TunnelManager) {
+	clientBufReader := bufio.NewReader(clientConn)
+
+	var bufferedLines [][]byte
+	var subscribeIDRaw json.RawMessage
+	var matchedGroup *Group
+	var matchedCoin string
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	authorizeFound := false
+	for !authorizeFound {
+		line, err := clientBufReader.ReadBytes('\n')
+		if len(line) > 0 {
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) > 0 {
+				var msg struct {
+					ID     json.RawMessage `json:"id"`
+					Method string          `json:"method"`
+					Params json.RawMessage `json:"params"`
+				}
+				if json.Unmarshal(trimmed, &msg) == nil {
+					switch msg.Method {
+					case "mining.subscribe":
+						subscribeIDRaw = msg.ID
+						bufferedLines = append(bufferedLines, line)
+						idStr := "null"
+						if len(msg.ID) > 0 {
+							idStr = string(msg.ID)
+						}
+						fakeResp := fmt.Sprintf(`{"id":%s,"result":[[["mining.set_difficulty","1"],["mining.notify","1"]],"00000000",4],"error":null}`+"\n", idStr)
+						if _, wErr := clientConn.Write([]byte(fakeResp)); wErr != nil {
+							log.Printf("[%s] Failed sending fake subscribe response: %v", clientAddr, wErr)
+							_ = clientConn.Close()
+							return
+						}
+
+					case "mining.authorize":
+						bufferedLines = append(bufferedLines, line)
+						cfg := cm.Get()
+						var params []json.RawMessage
+						if json.Unmarshal(msg.Params, &params) == nil {
+							// Check password first (params[1]: "-p c=coin")
+							if len(params) >= 2 {
+								var password string
+								if json.Unmarshal(params[1], &password) == nil {
+									matchedGroup, matchedCoin = findCoinInText(password, cfg)
+								}
+							}
+							// Fallback: check username (params[0])
+							if matchedGroup == nil && len(params) >= 1 {
+								var username string
+								if json.Unmarshal(params[0], &username) == nil {
+									matchedGroup, matchedCoin = findCoinInText(username, cfg)
+								}
+							}
+						}
+						authorizeFound = true
+
+					default:
+						bufferedLines = append(bufferedLines, line)
+					}
+				} else {
+					bufferedLines = append(bufferedLines, line)
+				}
+			}
+		}
+		if err != nil {
+			if !authorizeFound {
+				log.Printf("[%s] Connection closed before mining.authorize: %v", clientAddr, err)
+				_ = clientConn.Close()
+				return
+			}
+			break
+		}
+	}
+	_ = clientConn.SetReadDeadline(time.Time{})
+
+	if matchedGroup == nil {
+		log.Printf("[%s] Routing failed: no matching coin found in mining.authorize", clientAddr)
+		_ = clientConn.Close()
+		return
+	}
+
+	log.Printf("[%s] Coin identified: %s → group %s", clientAddr, matchedCoin, matchedGroup.Name)
+
+	// Pop tunnel with retry (up to 3 seconds).
+	var tunnelConn net.Conn
+	startWait := time.Now()
+	for {
+		var popErr error
+		tunnelConn, popErr = tm.Pop(matchedGroup.Name)
+		if popErr == nil {
+			break
+		}
+		if time.Since(startWait) > 3*time.Second {
+			log.Printf("[%s] Timeout waiting for tunnel in group %s", clientAddr, matchedGroup.Name)
+			_ = clientConn.Close()
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if tcpConn, ok := tunnelConn.(*net.TCPConn); ok {
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
+	}
+
+	// Replay buffered messages (subscribe + any extras + authorize) to backend.
+	var bytesSent int64
+	for _, bl := range bufferedLines {
+		if _, wErr := tunnelConn.Write(bl); wErr != nil {
+			log.Printf("[%s] Failed replaying to tunnel: %v", clientAddr, wErr)
+			_ = tunnelConn.Close()
+			_ = clientConn.Close()
+			return
+		}
+		bytesSent += int64(len(bl))
+	}
+
+	log.Printf("[%s] Routed to group %s (coin: %s)", clientAddr, matchedGroup.Name, matchedCoin)
+
+	// Read backend responses, intercept the subscribe response to extract the
+	// real extranonce1 and send mining.set_extranonce to the miner instead.
+	tunnelBufReader := bufio.NewReader(tunnelConn)
+	if subscribeIDRaw != nil {
+		_ = tunnelConn.SetReadDeadline(time.Now().Add(15 * time.Second))
+		for {
+			respLine, err := tunnelBufReader.ReadBytes('\n')
+			if len(respLine) > 0 {
+				trimmed := bytes.TrimSpace(respLine)
+				var resp struct {
+					ID     json.RawMessage `json:"id"`
+					Method string          `json:"method"`
+					Result json.RawMessage `json:"result"`
+				}
+				isSubscribeResp := json.Unmarshal(trimmed, &resp) == nil &&
+					resp.Method == "" &&
+					len(resp.ID) > 0 &&
+					string(resp.ID) == string(subscribeIDRaw)
+
+				if isSubscribeResp {
+					var result []json.RawMessage
+					if json.Unmarshal(resp.Result, &result) == nil && len(result) >= 3 {
+						var e1 string
+						var e2size int
+						_ = json.Unmarshal(result[1], &e1)
+						_ = json.Unmarshal(result[2], &e2size)
+						if e1 != "" {
+							setMsg := fmt.Sprintf(`{"id":null,"method":"mining.set_extranonce","params":["%s",%d]}`+"\n", e1, e2size)
+							_, _ = clientConn.Write([]byte(setMsg))
+							log.Printf("[%s] Sent mining.set_extranonce: %s/%d", clientAddr, e1, e2size)
+						}
+					}
+					// Subscribe response consumed; switch to bidirectional pipe.
+					_ = tunnelConn.SetReadDeadline(time.Time{})
+					break
+				}
+				// Forward non-subscribe responses to miner.
+				_, _ = clientConn.Write(respLine)
+			}
+			if err != nil {
+				// Timeout or EOF before finding subscribe response — proceed to pipe anyway.
+				log.Printf("[%s] Subscribe response not intercepted: %v", clientAddr, err)
+				_ = tunnelConn.SetReadDeadline(time.Time{})
+				break
+			}
+		}
+	}
+
+	// Bidirectional pipe for the remainder of the session.
+	var bytesReceived int64
+	startTime := time.Now()
+	done := make(chan struct{}, 1)
+
+	clientWrapped := &BufferedConn{Conn: clientConn, r: clientBufReader}
+	tunnelWrapped := &BufferedConn{Conn: tunnelConn, r: tunnelBufReader}
+
+	safeGo("pipe_c2t_"+clientAddr, func() {
+		cw := CountedWriter{w: tunnelWrapped, c: &bytesSent}
+		_, _ = io.Copy(cw, clientWrapped)
+		_ = tunnelWrapped.Close()
+		_ = clientWrapped.Close()
+		done <- struct{}{}
+	})
+
+	cw := CountedWriter{w: clientWrapped, c: &bytesReceived}
+	_, _ = io.Copy(cw, tunnelWrapped)
+	_ = clientWrapped.Close()
+	_ = tunnelWrapped.Close()
+	<-done
+
+	duration := time.Since(startTime)
+	log.Printf("[%s] Connection closed. Group: %s | Duration: %s | Bytes Sent: %d | Bytes Rcvd: %d",
+		clientAddr, matchedGroup.Name, duration.Truncate(time.Second),
+		atomic.LoadInt64(&bytesSent), atomic.LoadInt64(&bytesReceived))
 }

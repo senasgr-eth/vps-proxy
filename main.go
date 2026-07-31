@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,9 +24,11 @@ import (
 )
 
 type Group struct {
-	Name   string   `json:"name"`
-	Listen string   `json:"listen"`
-	Coins  []string `json:"coins"`
+	Name         string   `json:"name"`
+	Listen       string   `json:"listen"`
+	Coins        []string `json:"coins"`
+	MagicBytes   []string `json:"magic_bytes"`
+	VersionProto int      `json:"version_proto"`
 }
 
 type Config struct {
@@ -562,6 +565,15 @@ func runMinerAcceptLoop(ctx context.Context, listener net.Listener, cm *ConfigMa
 	}
 }
 
+func configHasMagicBytes(cfg *Config) bool {
+	for _, g := range cfg.Groups {
+		if len(g.MagicBytes) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, groupName string) {
 	if groupName == "panic_trigger_for_test" {
 		panic("simulated test panic")
@@ -574,7 +586,7 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 	}
 
 	if groupName == "" {
-		routeByProtocol(clientAddr, clientConn, cm, tm)
+		routeByMagicBytes(clientAddr, clientConn, cm, tm)
 		return
 	}
 
@@ -607,11 +619,19 @@ func handleMiner(clientConn net.Conn, cm *ConfigManager, tm *TunnelManager, grou
 	var tunnelConn net.Conn
 	var popErr error
 	startWait := time.Now()
-	proxyHeader := proxyProtoHeader(clientConn)
+	isP2P := len(matchedGroup.MagicBytes) > 0
 	for {
 		tunnelConn, popErr = tm.Pop(matchedGroup.Name)
 		if popErr == nil {
-			payload := append(proxyHeader, firstChunk...)
+			var payload []byte
+			if isP2P {
+				// P2P group: no PROXY header, send data directly
+				payload = firstChunk
+			} else {
+				// Stratum group: prepend PROXY header so pool sees real miner IP
+				proxyHeader := proxyProtoHeader(clientConn)
+				payload = append(proxyHeader, firstChunk...)
+			}
 			_, writeErr := tunnelConn.Write(payload)
 			if writeErr == nil {
 				break
@@ -672,6 +692,183 @@ func proxyProtoHeader(clientConn net.Conn) []byte {
 		proto = "TCP6"
 	}
 	return []byte(fmt.Sprintf("PROXY %s %s %s %s %s\r\n", proto, clientIP, serverIP, clientPort, serverPort))
+}
+
+// routeByMagicBytes handles blockchain P2P connections on the global port.
+// It reads the first 4 bytes (magic bytes / pchMessageStart) and routes to the
+// matching backend group. For coins with the same magic bytes, it disambiguates
+// by reading the version number from the version message.
+func routeByMagicBytes(clientAddr string, clientConn net.Conn, cm *ConfigManager, tm *TunnelManager) {
+	_ = clientConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	// Read 4 magic bytes
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(clientConn, magic); err != nil {
+		log.Printf("[%s] Failed to read magic bytes: %v", clientAddr, err)
+		_ = clientConn.Close()
+		return
+	}
+	magicHex := hex.EncodeToString(magic)
+
+	_ = clientConn.SetReadDeadline(time.Time{})
+
+	cfg := cm.Get()
+
+	// Find matching groups by magic bytes
+	var candidates []*Group
+	for i := range cfg.Groups {
+		g := &cfg.Groups[i]
+		for _, mb := range g.MagicBytes {
+			if strings.EqualFold(mb, magicHex) {
+				candidates = append(candidates, g)
+				break
+			}
+		}
+	}
+
+	if len(candidates) == 0 {
+		// No P2P magic match — fall back to stratum coin scanning.
+		// Reconstruct the connection with the magic bytes prepended.
+		wrapped := &BufferedConn{
+			Conn: clientConn,
+			r:    io.MultiReader(bytes.NewReader(magic), clientConn),
+		}
+		routeByProtocol(clientAddr, wrapped, cm, tm)
+		return
+	}
+
+	var matchedGroup *Group
+
+	if len(candidates) == 1 {
+		matchedGroup = candidates[0]
+	} else {
+		// Collision: multiple groups share same magic bytes.
+		// Disambiguate by reading the version message protocol version.
+		matchedGroup = resolveByVersion(clientAddr, clientConn, magic, candidates)
+		if matchedGroup == nil {
+			log.Printf("[%s] Could not disambiguate %d groups for magic %s — dropping",
+				clientAddr, len(candidates), magicHex)
+			_ = clientConn.Close()
+			return
+		}
+	}
+
+	log.Printf("[%s] Magic %s → group %s", clientAddr, magicHex, matchedGroup.Name)
+
+	// Pop tunnel and forward (magic bytes prepended to buffered data)
+	var tunnelConn net.Conn
+	startWait := time.Now()
+	for {
+		var popErr error
+		tunnelConn, popErr = tm.Pop(matchedGroup.Name)
+		if popErr == nil {
+			break
+		}
+		if time.Since(startWait) > 3*time.Second {
+			log.Printf("[%s] Timeout waiting for tunnel in group %s", clientAddr, matchedGroup.Name)
+			_ = clientConn.Close()
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if tcpConn, ok := tunnelConn.(*net.TCPConn); ok {
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(3 * time.Minute)
+	}
+
+	// Write magic bytes to tunnel (no PROXY header for P2P — daemons dont understand it)
+	_, _ = tunnelConn.Write(magic)
+
+	// Bidirectional pipe (magic bytes already consumed from client, need to replay them too)
+	var bytesSent int64 = 4
+	var bytesReceived int64
+	startTime := time.Now()
+	done := make(chan struct{}, 1)
+
+	safeGo("pipe_client_to_tunnel_p2p_"+clientAddr, func() {
+		cw := CountedWriter{w: tunnelConn, c: &bytesSent}
+		_, _ = io.Copy(cw, clientConn)
+		_ = tunnelConn.Close()
+		_ = clientConn.Close()
+		done <- struct{}{}
+	})
+
+	cw := CountedWriter{w: clientConn, c: &bytesReceived}
+	_, _ = io.Copy(cw, tunnelConn)
+	_ = clientConn.Close()
+	_ = tunnelConn.Close()
+	<-done
+
+	duration := time.Since(startTime)
+	log.Printf("[%s] P2P closed. Group: %s | Duration: %s | Bytes Sent: %d | Bytes Rcvd: %d",
+		clientAddr, matchedGroup.Name, duration.Truncate(time.Second),
+		atomic.LoadInt64(&bytesSent), atomic.LoadInt64(&bytesReceived))
+}
+
+// resolveByVersion disambiguates between groups with the same magic bytes
+// by reading the version number from the Bitcoin P2P version message.
+//
+// Bitcoin P2P message header after magic:
+//
+//	 4 bytes magic (already consumed)
+//	12 bytes command ("version\0\0\0\0\0")
+//	 4 bytes payload length (uint32 LE)
+//	 4 bytes checksum
+//	 4 bytes version (int32 LE) — first field of version payload
+func resolveByVersion(clientAddr string, clientConn net.Conn, magic []byte, candidates []*Group) *Group {
+	// Read the rest of the message header: command (12) + payload_len (4) + checksum (4) = 20 bytes
+	headerTail := make([]byte, 20)
+	if _, err := io.ReadFull(clientConn, headerTail); err != nil {
+		log.Printf("[%s] Failed to read version header: %v", clientAddr, err)
+		return nil
+	}
+
+	// Verify it's a "version" command
+	cmd := strings.TrimRight(string(headerTail[:12]), "\x00")
+	if cmd != "version" {
+		// First message not version — can't disambiguate, use first candidate
+		log.Printf("[%s] First message is %q not version — using %s", clientAddr, cmd, candidates[0].Name)
+		return candidates[0]
+	}
+
+	// Read payload length (uint32 LE)
+	payloadLen := int(headerTail[12]) | int(headerTail[13])<<8 | int(headerTail[14])<<16 | int(headerTail[15])<<24
+	if payloadLen < 4 || payloadLen > 1024*1024 {
+		log.Printf("[%s] Invalid payload length: %d", clientAddr, payloadLen)
+		return nil
+	}
+
+	// Read payload (we mainly need the first 4 bytes: version)
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(clientConn, payload); err != nil {
+		log.Printf("[%s] Failed to read version payload: %v", clientAddr, err)
+		return nil
+	}
+
+	// Parse version (int32 LE, first 4 bytes of payload)
+	protoVersion := int(payload[0]) | int(payload[1])<<8 | int(payload[2])<<16 | int(payload[3])<<24
+
+	log.Printf("[%s] P2P version=%d detected", clientAddr, protoVersion)
+
+	// Match by version_proto
+	for _, g := range candidates {
+		if g.VersionProto == protoVersion {
+			return g
+		}
+	}
+
+	// No exact version match — try exact match or use first candidate
+	for _, g := range candidates {
+		if g.VersionProto == 0 {
+			log.Printf("[%s] No version_proto match — using %s (version=%d)", clientAddr, g.Name, protoVersion)
+			return g
+		}
+	}
+
+	// Fallback to first candidate
+	log.Printf("[%s] Version %d not matched — falling back to %s", clientAddr, protoVersion, candidates[0].Name)
+	return candidates[0]
 }
 
 // findCoinInText scans text for "c=COIN" patterns and returns the matching group.

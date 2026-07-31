@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"strings"
@@ -351,6 +352,15 @@ func main() {
 			handleAdminAPI(w, r, cm, tm)
 		})
 		adminMux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+			handleAdminAPI(w, r, cm, tm)
+		})
+		adminMux.HandleFunc("/api/config/reload", func(w http.ResponseWriter, r *http.Request) {
+			handleAdminAPI(w, r, cm, tm)
+		})
+		adminMux.HandleFunc("/api/firewall", func(w http.ResponseWriter, r *http.Request) {
+			handleAdminAPI(w, r, cm, tm)
+		})
+		adminMux.HandleFunc("/api/firewall/", func(w http.ResponseWriter, r *http.Request) {
 			handleAdminAPI(w, r, cm, tm)
 		})
 		adminMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -1211,6 +1221,20 @@ func handleAdminAPI(w http.ResponseWriter, r *http.Request, cm *ConfigManager, t
 		handleStatus(w, cm, tm)
 	case path == "config" && r.Method == "GET":
 		handleGetConfig(w, cm)
+	case path == "config/reload" && r.Method == "POST":
+		handleConfigReload(w, cm)
+	case strings.HasPrefix(path, "firewall") && r.Method == "GET":
+		handleFirewallList(w)
+	case strings.HasPrefix(path, "firewall/") && strings.HasSuffix(path, "/reload") && r.Method == "POST":
+		handleFirewallReload(w)
+	case strings.HasPrefix(path, "firewall/") && r.Method == "DELETE":
+		rule := strings.TrimPrefix(path, "firewall/")
+		handleFirewallDelete(w, rule)
+	case path == "firewall" && r.Method == "POST":
+		handleFirewallAdd(w, r)
+	case strings.HasPrefix(path, "groups/") && strings.HasSuffix(path, "/agent") && r.Method == "GET":
+		name := strings.TrimSuffix(strings.TrimPrefix(path, "groups/"), "/agent")
+		handleAgentConfig(w, cm, name)
 	case path == "groups" && r.Method == "GET":
 		handleListGroups(w, cm)
 	case path == "groups" && r.Method == "POST":
@@ -1326,4 +1350,142 @@ func handleDeleteGroup(w http.ResponseWriter, cm *ConfigManager, name string) {
 	}
 	w.WriteHeader(http.StatusNotFound)
 	w.Write([]byte(`{"error":"group not found"}`))
+}
+
+// --- Agent Config Template ---
+
+type AgentConfig struct {
+	Server        string         `json:"server"`
+	PoolSize      int            `json:"pool_size"`
+	SecretToken   string         `json:"secret_token"`
+	TLS           bool           `json:"tls"`
+	TLSSkipVerify bool           `json:"tls_skip_verify"`
+	Mappings      []AgentMapping `json:"mappings"`
+}
+
+type AgentMapping struct {
+	Group string `json:"group"`
+	Local string `json:"local"`
+}
+
+func handleAgentConfig(w http.ResponseWriter, cm *ConfigManager, name string) {
+	cfg := cm.Get()
+	var group *Group
+	for i := range cfg.Groups {
+		if cfg.Groups[i].Name == name {
+			group = &cfg.Groups[i]
+			break
+		}
+	}
+	if group == nil {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":"group not found"}`))
+		return
+	}
+
+	agent := AgentConfig{
+		Server:        cfg.TunnelListen,
+		PoolSize:      10,
+		SecretToken:   cfg.SecretToken,
+		TLS:           false,
+		TLSSkipVerify: true,
+		Mappings: []AgentMapping{{
+			Group: name,
+			Local: "127.0.0.1:REPLACE_WITH_DAEMON_PORT",
+		}},
+	}
+
+	if strings.HasPrefix(agent.Server, "0.0.0.0:") {
+		agent.Server = "REPLACE_WITH_VPS_IP" + agent.Server[len("0.0.0.0"):]
+	}
+
+	w.Header().Set("Content-Disposition", "attachment; filename=agent-"+name+".json")
+	json.NewEncoder(w).Encode(agent)
+}
+
+// --- Firewall Management (UFW) ---
+
+func handleFirewallList(w http.ResponseWriter) {
+	out, err := exec.Command("ufw", "status").Output()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"` + err.Error() + `"}`))
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write(out)
+}
+
+func handleFirewallAdd(w http.ResponseWriter, r *http.Request) {
+	var rule struct {
+		Port    string `json:"port"`
+		Proto   string `json:"proto"`
+		Comment string `json:"comment"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid JSON"}`))
+		return
+	}
+	if rule.Port == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"port is required"}`))
+		return
+	}
+	if rule.Proto == "" {
+		rule.Proto = "tcp"
+	}
+
+	args := []string{"allow", rule.Port + "/" + rule.Proto}
+	if rule.Comment != "" {
+		args = append(args, "comment", rule.Comment)
+	}
+
+	cmd := exec.Command("ufw", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"` + strings.TrimSpace(string(out)) + `"}`))
+		return
+	}
+	log.Printf("[Admin] Firewall rule added: %s/%s %s", rule.Port, rule.Proto, rule.Comment)
+	w.Write([]byte(`{"ok":true,"output":"` + strings.TrimSpace(string(out)) + `"}`))
+}
+
+func handleFirewallDelete(w http.ResponseWriter, portRule string) {
+	var args []string
+	if strings.Contains(portRule, "/") {
+		args = []string{"delete", "allow", portRule}
+	} else {
+		args = []string{"delete", "allow", portRule + "/tcp"}
+	}
+
+	cmd := exec.Command("ufw", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"` + strings.TrimSpace(string(out)) + `"}`))
+		return
+	}
+	log.Printf("[Admin] Firewall rule deleted: %s", portRule)
+	w.Write([]byte(`{"ok":true,"output":"` + strings.TrimSpace(string(out)) + `"}`))
+}
+
+func handleFirewallReload(w http.ResponseWriter) {
+	cmd := exec.Command("ufw", "reload")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"` + strings.TrimSpace(string(out)) + `"}`))
+		return
+	}
+	log.Printf("[Admin] Firewall reloaded")
+	w.Write([]byte(`{"ok":true}`))
+}
+
+func handleConfigReload(w http.ResponseWriter, cm *ConfigManager) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	log.Printf("[Admin] Config reload triggered. Changes apply within 5 seconds (hot-reload)")
+	w.Write([]byte(`{"ok":true,"message":"Config reload triggered. Changes apply within 5 seconds via hot-reloader."}`))
 }

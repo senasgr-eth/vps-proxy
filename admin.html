@@ -24,33 +24,27 @@ body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;bac
 .toolbar h2{font-size:16px;color:#e6edf3}
 .btn{background:#238636;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500}
 .btn:hover{background:#2ea043}
-.btn.danger{background:#da3633}
-.btn.danger:hover{background:#f85149}
-.btn.secondary{background:#21262d;border:1px solid #30363d}
-.btn.secondary:hover{background:#30363d}
+.btn.danger{background:#da3633}.btn.danger:hover{background:#f85149}
+.btn.secondary{background:#21262d;border:1px solid #30363d}.btn.secondary:hover{background:#30363d}
 table{width:100%;border-collapse:collapse;background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}
 th,td{text-align:left;padding:10px 14px;font-size:13px;border-bottom:1px solid #21262d}
 th{color:#8b949e;font-weight:500;background:#0d1117}
-td{color:#c9d1d9}
 .tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
 .tag.p2p{background:#1f6feb33;color:#58a6ff}
 .tag.stratum{background:#23863633;color:#3fb950}
 .action-btn{background:none;border:none;color:#8b949e;cursor:pointer;padding:4px 8px;font-size:12px;border-radius:4px}
 .action-btn:hover{color:#e6edf3;background:#21262d}
 .action-btn.delete:hover{color:#f85149}
-
+.action-btn.agent:hover{color:#58a6ff}
 .modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:100;align-items:center;justify-content:center}
 .modal.active{display:flex}
 .modal-content{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:90%;max-width:520px;max-height:90vh;overflow-y:auto}
 .modal h2{font-size:16px;margin-bottom:16px;color:#e6edf3}
-.form-group{margin-bottom:14px}
-.form-group label{display:block;font-size:12px;color:#8b949e;margin-bottom:4px;text-transform:uppercase}
+.form-group{margin-bottom:14px}.form-group label{display:block;font-size:12px;color:#8b949e;margin-bottom:4px;text-transform:uppercase}
 .form-group input,.form-group select{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 12px;color:#c9d1d9;font-size:13px}
-.form-group input:focus{border-color:#58a6ff;outline:none}
+.form-group input:focus,.form-group textarea:focus{border-color:#58a6ff;outline:none}
 .form-group textarea{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 12px;color:#c9d1d9;font-size:13px;font-family:monospace;min-height:80px;resize:vertical}
-.form-group textarea:focus{border-color:#58a6ff;outline:none}
-.form-row{display:flex;gap:12px}
-.form-row .btn{flex:1}
+.form-row{display:flex;gap:12px}.form-row .btn{flex:1}
 .login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;width:90%;max-width:360px;text-align:center}
 .login-box h2{margin-bottom:20px;color:#e6edf3}
 .login-box input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 14px;color:#c9d1d9;font-size:14px;margin-bottom:12px;text-align:center}
@@ -58,6 +52,7 @@ td{color:#c9d1d9}
 .toast{position:fixed;bottom:20px;right:20px;background:#238636;color:#fff;padding:12px 20px;border-radius:8px;font-size:13px;z-index:200;opacity:0;transition:opacity .3s}
 .toast.show{opacity:1}
 .empty{text-align:center;color:#8b949e;padding:48px;font-size:14px}
+.fw-input{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 12px;color:#c9d1d9;font-size:13px;flex:1}
 </style>
 </head>
 <body>
@@ -91,12 +86,36 @@ td{color:#c9d1d9}
 
   <div class="toolbar">
     <h2>Groups</h2>
-    <button class="btn" onclick="openAddModal()">+ Add Group</button>
+    <div style="display:flex;gap:8px">
+      <button class="btn secondary" onclick="reloadConfig()">Reload Config</button>
+      <button class="btn" onclick="openAddModal()">+ Add Group</button>
+    </div>
   </div>
   <table id="groupTable">
-    <thead><tr><th>Name</th><th>Listen</th><th>Type</th><th>Tunnels</th><th>Coins / Magic</th><th></th></tr></thead>
+    <thead><tr><th>Name</th><th>Listen</th><th>Type</th><th>Tunnels</th><th>Coins / Magic</th><th>Actions</th></tr></thead>
     <tbody id="groupBody"></tbody>
   </table>
+
+  <div class="toolbar" style="margin-top:32px">
+    <h2>Firewall (UFW)</h2>
+    <div style="display:flex;gap:8px">
+      <button class="btn secondary" onclick="reloadFirewall()">Reload</button>
+      <button class="btn secondary" onclick="refreshFirewall()">Refresh</button>
+    </div>
+  </div>
+  <table>
+    <thead><tr><th>Port/Proto</th><th>Action</th><th>From</th><th>Comment</th></tr></thead>
+    <tbody id="firewallBody"></tbody>
+  </table>
+  <div style="display:flex;gap:8px;margin-top:12px">
+    <input id="fwPort" placeholder="Port (e.g. 3333/tcp)" class="fw-input">
+    <input id="fwComment" placeholder="Comment" class="fw-input">
+    <button class="btn" onclick="addFirewall()">Add Rule</button>
+  </div>
+  <div style="display:flex;gap:8px;margin-top:12px;align-items:center">
+    <input id="fwDelete" placeholder="Port/proto to delete (e.g. 3333/tcp)" class="fw-input">
+    <button class="btn danger" onclick="delFirewall()">Delete</button>
+  </div>
 </div>
 </div>
 
@@ -105,12 +124,12 @@ td{color:#c9d1d9}
 <div class="modal" id="groupModal">
   <div class="modal-content">
     <h2 id="modalTitle">Add Group</h2>
-    <div class="form-group"><label>Group Name</label><input id="eName" placeholder="e.g. wojak, stratum_scrypt"></div>
-    <div class="form-group"><label>Listen Address</label><input id="eListen" placeholder="0.0.0.0:PORT (empty = use global port)"></div>
+    <div class="form-group"><label>Group Name</label><input id="eName" placeholder="e.g. wojak"></div>
+    <div class="form-group"><label>Listen Address</label><input id="eListen" placeholder="0.0.0.0:PORT (empty = global)"></div>
     <div class="form-group"><label>Type</label><select id="eType" onchange="toggleTypeFields()"><option value="p2p">P2P (magic bytes)</option><option value="stratum">Stratum (coin symbols)</option></select></div>
     <div class="form-group" id="magicField"><label>Magic Bytes (hex, one per line)</label><textarea id="eMagic" placeholder="6f8da579"></textarea></div>
-    <div class="form-group" id="versionField"><label>Version Proto (for collision resolution, 0=any)</label><input id="eVersion" type="number" value="0" placeholder="e.g. 70015"></div>
-    <div class="form-group" id="coinsField" style="display:none"><label>Coin Symbols (one per line)</label><textarea id="eCoins" placeholder="WOJAK&#10;JKC&#10;LNC"></textarea></div>
+    <div class="form-group" id="versionField"><label>Version Proto (0=any)</label><input id="eVersion" type="number" value="0"></div>
+    <div class="form-group" id="coinsField" style="display:none"><label>Coin Symbols (one per line)</label><textarea id="eCoins" placeholder="WOJAK"></textarea></div>
     <div class="form-row">
       <button class="btn secondary" onclick="closeModal()">Cancel</button>
       <button class="btn" id="saveBtn" onclick="saveGroup()">Save</button>
@@ -120,11 +139,9 @@ td{color:#c9d1d9}
 
 <script>
 let token = localStorage.getItem('admin_token') || '';
-
 function api(path, opts={}) {
   return fetch('/api/'+path, {...opts, headers:{'Content-Type':'application/json','Authorization':'Bearer '+token,...(opts.headers||{})}}).then(r=>r.json());
 }
-
 async function login() {
   token = document.getElementById('token-input').value;
   localStorage.setItem('admin_token', token);
@@ -133,13 +150,11 @@ async function login() {
     if (r.error) throw r.error;
     document.getElementById('login').classList.remove('active');
     document.getElementById('app').style.display = 'block';
-    refresh();
+    refresh(); refreshFirewall();
     setInterval(refresh, 5000);
-  } catch(e) {
-    toast('Invalid token');
-  }
+    setInterval(refreshFirewall, 15000);
+  } catch(e) { toast('Invalid token'); }
 }
-
 function logout() {
   localStorage.removeItem('admin_token');
   token = '';
@@ -155,51 +170,46 @@ async function refresh() {
     document.getElementById('maxConns').textContent = s.max_connections;
     let total = Object.values(s.tunnel_counts||{}).reduce((a,b)=>a+b,0);
     document.getElementById('totalTunnels').textContent = total;
-
     let tl = document.getElementById('tunnelList');
-    tl.innerHTML = Object.entries(s.tunnel_counts||{}).map(([g,c])=>`<div class="tunnel-badge">${g}<span class="count">${c}</span></div>`).join('')||'<span class="empty">No tunnels</span>';
+    tl.innerHTML = Object.entries(s.tunnel_counts||{}).map(([g,c])=>
+      '<div class="tunnel-badge">'+g+'<span class="count">'+c+'</span></div>'
+    ).join('')||'<span class="empty">No tunnels</span>';
 
     let groups = await api('groups');
     document.getElementById('groupCount').textContent = groups.length;
     let tb = document.getElementById('groupBody');
-    if (!groups.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">No groups configured</td></tr>'; return; }
+    if (!groups.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">No groups</td></tr>'; return; }
     tb.innerHTML = groups.map((g,i)=>{
       let type = g.magic_bytes?.length ? 'p2p' : 'stratum';
       let coins = g.magic_bytes?.join(', ') || g.coins?.join(', ') || '-';
-      return `<tr>
-        <td><strong>${g.name}</strong></td>
-        <td>${g.listen||'<span style="color:#8b949e">global</span>'}</td>
-        <td><span class="tag ${type}">${type.toUpperCase()}</span></td>
-        <td>${s.tunnel_counts?.[g.name]??0}</td>
-        <td style="font-size:11px;font-family:monospace;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${coins}</td>
-        <td>
-          <button class="action-btn" onclick="openEditModal(${i})">Edit</button>
-          <button class="action-btn delete" onclick="deleteGroup(${i})">Del</button>
-        </td></tr>`;
+      let tunnelCount = s.tunnel_counts?.[g.name]??0;
+      return '<tr><td><strong>'+g.name+'</strong></td>'+
+        '<td>'+(g.listen||'<span style="color:#8b949e">global</span>')+'</td>'+
+        '<td><span class="tag '+type+'">'+type.toUpperCase()+'</span></td>'+
+        '<td>'+tunnelCount+'</td>'+
+        '<td style="font-size:11px;font-family:monospace;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+coins+'</td>'+
+        '<td>'+
+          '<button class="action-btn agent" onclick="downloadAgent(\''+g.name+'\')">Agent</button>'+
+          '<button class="action-btn" onclick="openEditModal('+i+')">Edit</button>'+
+          '<button class="action-btn delete" onclick="deleteGroup('+i+')">Del</button>'+
+        '</td></tr>';
     }).join('');
   } catch(e) { console.error(e); }
 }
 
-let editIndex = -1;
-let groups = [];
-
+let editIndex = -1, groups = [];
 function openAddModal() {
   editIndex = -1;
   document.getElementById('modalTitle').textContent = 'Add Group';
-  document.getElementById('eName').value = '';
-  document.getElementById('eListen').value = '';
+  ['eName','eListen','eMagic','eCoins'].forEach(id=>document.getElementById(id).value='');
   document.getElementById('eType').value = 'p2p';
-  document.getElementById('eMagic').value = '';
   document.getElementById('eVersion').value = '0';
-  document.getElementById('eCoins').value = '';
   toggleTypeFields();
   document.getElementById('groupModal').classList.add('active');
 }
-
 async function openEditModal(i) {
   groups = await api('groups');
-  let g = groups[i];
-  editIndex = i;
+  let g = groups[i]; editIndex = i;
   document.getElementById('modalTitle').textContent = 'Edit Group';
   document.getElementById('eName').value = g.name;
   document.getElementById('eListen').value = g.listen||'';
@@ -217,13 +227,9 @@ async function openEditModal(i) {
   toggleTypeFields();
   document.getElementById('groupModal').classList.add('active');
 }
-
 async function saveGroup() {
   let type = document.getElementById('eType').value;
-  let g = {
-    name: document.getElementById('eName').value,
-    listen: document.getElementById('eListen').value||undefined,
-  };
+  let g = { name: document.getElementById('eName').value, listen: document.getElementById('eListen').value||undefined };
   if (type === 'p2p') {
     g.magic_bytes = document.getElementById('eMagic').value.split('\n').map(s=>s.trim()).filter(Boolean);
     g.version_proto = parseInt(document.getElementById('eVersion').value)||0;
@@ -239,39 +245,103 @@ async function saveGroup() {
       await fetch('/api/groups', {method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify(g)});
       toast('Group added');
     }
-    closeModal();
-    refresh();
+    closeModal(); refresh();
   } catch(e) { toast('Error: '+e.message); }
 }
-
 async function deleteGroup(i) {
   if (!confirm('Delete this group?')) return;
   groups = await api('groups');
   let g = groups[i];
   await fetch('/api/groups/'+g.name, {method:'DELETE',headers:{'Authorization':'Bearer '+token}});
-  toast('Group deleted');
-  refresh();
+  toast('Group deleted'); refresh();
 }
-
 function toggleTypeFields() {
   let t = document.getElementById('eType').value;
   document.getElementById('magicField').style.display = t==='p2p'?'':'none';
   document.getElementById('versionField').style.display = t==='p2p'?'':'none';
   document.getElementById('coinsField').style.display = t==='stratum'?'':'none';
 }
-
 function closeModal() { document.getElementById('groupModal').classList.remove('active'); }
-
 function toast(msg) {
   let t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
+  t.textContent = msg; t.classList.add('show');
   setTimeout(()=>t.classList.remove('show'), 2000);
+}
+
+async function downloadAgent(name) {
+  let r = await fetch('/api/groups/'+name+'/agent', {headers:{'Authorization':'Bearer '+token}});
+  let blob = await r.blob();
+  let a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'agent-'+name+'.json';
+  a.click();
+  toast('Agent config downloaded');
+}
+
+async function refreshFirewall() {
+  let r = await fetch('/api/firewall', {headers:{'Authorization':'Bearer '+token}});
+  let text = await r.text();
+  let lines = text.split('\n').filter(l=>l.match(/^\d|^\w|Anywhere/));
+  let html = '';
+  for (let l of lines) {
+    let parts = l.trim().split(/\s+/);
+    if (parts.length >= 3) {
+      html += '<tr><td style="font-family:monospace;font-size:11px">'+parts[0]+'</td>'+
+        '<td>'+parts[1]+'</td><td style="font-size:11px">'+parts[2]+'</td>'+
+        '<td style="font-size:11px;color:#8b949e">'+parts.slice(3).join(' ')+'</td></tr>';
+    }
+  }
+  document.getElementById('firewallBody').innerHTML = html||'<tr><td colspan="4" class="empty">No rules or error</td></tr>';
+}
+
+async function addFirewall() {
+  let port = document.getElementById('fwPort').value;
+  let comment = document.getElementById('fwComment').value;
+  if (!port) return toast('Port required');
+  let parts = port.split('/');
+  let r = await fetch('/api/firewall', {
+    method:'POST',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+    body:JSON.stringify({port:parts[0],proto:parts[1]||'tcp',comment})
+  });
+  let j = await r.json();
+  toast(j.error||'Rule added');
+  if (!j.error) { document.getElementById('fwPort').value=''; document.getElementById('fwComment').value=''; }
+  refreshFirewall();
+}
+
+async function delFirewall() {
+  let port = document.getElementById('fwDelete').value;
+  if (!port) return toast('Port/proto required');
+  let r = await fetch('/api/firewall/'+port, {method:'DELETE',headers:{'Authorization':'Bearer '+token}});
+  let j = await r.json();
+  toast(j.error||'Rule deleted');
+  if (!j.error) document.getElementById('fwDelete').value='';
+  refreshFirewall();
+}
+
+async function reloadFirewall() {
+  let r = await fetch('/api/firewall/reload', {method:'POST',headers:{'Authorization':'Bearer '+token}});
+  let j = await r.json();
+  toast(j.error||'Firewall reloaded');
+  refreshFirewall();
+}
+
+async function reloadConfig() {
+  let r = await fetch('/api/config/reload', {method:'POST',headers:{'Authorization':'Bearer '+token}});
+  let j = await r.json();
+  toast(j.error||'Config reload triggered');
 }
 
 if (token) {
   api('status').then(s=>{
-    if (!s.error) { document.getElementById('login').classList.remove('active'); document.getElementById('app').style.display='block'; refresh(); setInterval(refresh,5000); }
+    if (!s.error) {
+      document.getElementById('login').classList.remove('active');
+      document.getElementById('app').style.display='block';
+      refresh(); refreshFirewall();
+      setInterval(refresh, 5000);
+      setInterval(refreshFirewall, 15000);
+    }
   }).catch(()=>{});
 }
 </script>

@@ -110,7 +110,8 @@ th{color:#8b949e;font-weight:500;background:#0d1117}
   <div style="display:flex;gap:8px;margin-top:12px">
     <input id="fwPort" placeholder="Port (e.g. 3333/tcp)" class="fw-input">
     <input id="fwComment" placeholder="Comment" class="fw-input">
-    <button class="btn" onclick="addFirewall()">Add Rule</button>
+    <button class="btn" id="fwAddBtn" onclick="addFirewall()">Add Rule</button>
+    <button class="btn secondary" id="fwCancelEdit" onclick="cancelFirewallEdit()" style="display:none">Cancel</button>
   </div>
 </div>
 </div>
@@ -286,7 +287,10 @@ async function refreshFirewall() {
       html += '<tr><td style="font-family:monospace;font-size:11px">'+portProto+'</td>'+
         '<td>'+parts[1]+'</td><td style="font-size:11px">'+parts[2]+'</td>'+
         '<td style="font-size:11px;color:#8b949e">'+parts.slice(3).join(' ')+'</td>'+
-        '<td><button class="action-btn delete" onclick="delFirewall(\''+portProto+'\')">Del</button></td></tr>';
+        '<td>'+
+          '<button class="action-btn" onclick="editFirewall(\''+portProto+'\',\''+(parts.slice(3).join(' ').replace(/'/g,"\\'"))+'\')">Edit</button>'+
+          '<button class="action-btn delete" onclick="delFirewall(\''+portProto+'\')">Del</button>'+
+        '</td></tr>';
     }
   }
   document.getElementById('firewallBody').innerHTML = html||'<tr><td colspan="5" class="empty">No rules or error</td></tr>';
@@ -314,6 +318,48 @@ async function delFirewall(port) {
   let r = await fetch('/api/firewall/'+port, {method:'DELETE',headers:{'Authorization':'Bearer '+token}});
   let j = await r.json();
   toast(j.error||'Rule deleted');
+  refreshFirewall();
+}
+
+let editingFirewall = null;
+function editFirewall(port, comment) {
+  editingFirewall = port;
+  document.getElementById('fwPort').value = port;
+  document.getElementById('fwComment').value = comment.replace(/^#\s*/,'');
+  document.getElementById('fwAddBtn').textContent = 'Update';
+  document.getElementById('fwAddBtn').style.background = '#da3633';
+  document.getElementById('fwCancelEdit').style.display = 'inline';
+  document.getElementById('fwPort').focus();
+}
+
+function cancelFirewallEdit() {
+  editingFirewall = null;
+  document.getElementById('fwPort').value = '';
+  document.getElementById('fwComment').value = '';
+  document.getElementById('fwAddBtn').textContent = 'Add Rule';
+  document.getElementById('fwAddBtn').style.background = '#238636';
+  document.getElementById('fwCancelEdit').style.display = 'none';
+}
+
+async function addFirewall() {
+  let port = document.getElementById('fwPort').value;
+  let comment = document.getElementById('fwComment').value;
+  if (!port) return toast('Port required');
+
+  if (editingFirewall) {
+    // Edit mode: delete old, add new
+    await fetch('/api/firewall/'+editingFirewall, {method:'DELETE',headers:{'Authorization':'Bearer '+token}});
+  }
+
+  let parts = port.split('/');
+  let r = await fetch('/api/firewall', {
+    method:'POST',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+    body:JSON.stringify({port:parts[0],proto:parts[1]||'tcp',comment})
+  });
+  let j = await r.json();
+  toast(j.error||(editingFirewall ? 'Rule updated' : 'Rule added'));
+  if (!j.error) cancelFirewallEdit();
   refreshFirewall();
 }
 

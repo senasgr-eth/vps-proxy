@@ -104,17 +104,13 @@ th{color:#8b949e;font-weight:500;background:#0d1117}
     </div>
   </div>
   <table>
-    <thead><tr><th>Port/Proto</th><th>Action</th><th>From</th><th>Comment</th></tr></thead>
+    <thead><tr><th>Port/Proto</th><th>Action</th><th>From</th><th>Comment</th><th></th></tr></thead>
     <tbody id="firewallBody"></tbody>
   </table>
   <div style="display:flex;gap:8px;margin-top:12px">
     <input id="fwPort" placeholder="Port (e.g. 3333/tcp)" class="fw-input">
     <input id="fwComment" placeholder="Comment" class="fw-input">
     <button class="btn" onclick="addFirewall()">Add Rule</button>
-  </div>
-  <div style="display:flex;gap:8px;margin-top:12px;align-items:center">
-    <input id="fwDelete" placeholder="Port/proto to delete (e.g. 3333/tcp)" class="fw-input">
-    <button class="btn danger" onclick="delFirewall()">Delete</button>
   </div>
 </div>
 </div>
@@ -286,12 +282,14 @@ async function refreshFirewall() {
   for (let l of lines) {
     let parts = l.trim().split(/\s+/);
     if (parts.length >= 3) {
-      html += '<tr><td style="font-family:monospace;font-size:11px">'+parts[0]+'</td>'+
+      let portProto = parts[0];
+      html += '<tr><td style="font-family:monospace;font-size:11px">'+portProto+'</td>'+
         '<td>'+parts[1]+'</td><td style="font-size:11px">'+parts[2]+'</td>'+
-        '<td style="font-size:11px;color:#8b949e">'+parts.slice(3).join(' ')+'</td></tr>';
+        '<td style="font-size:11px;color:#8b949e">'+parts.slice(3).join(' ')+'</td>'+
+        '<td><button class="action-btn delete" onclick="delFirewall(\''+portProto+'\')">Del</button></td></tr>';
     }
   }
-  document.getElementById('firewallBody').innerHTML = html||'<tr><td colspan="4" class="empty">No rules or error</td></tr>';
+  document.getElementById('firewallBody').innerHTML = html||'<tr><td colspan="5" class="empty">No rules or error</td></tr>';
 }
 
 async function addFirewall() {
@@ -310,13 +308,12 @@ async function addFirewall() {
   refreshFirewall();
 }
 
-async function delFirewall() {
-  let port = document.getElementById('fwDelete').value;
-  if (!port) return toast('Port/proto required');
+async function delFirewall(port) {
+  if (!port) return;
+  if (!confirm('Delete firewall rule: '+port+'?')) return;
   let r = await fetch('/api/firewall/'+port, {method:'DELETE',headers:{'Authorization':'Bearer '+token}});
   let j = await r.json();
   toast(j.error||'Rule deleted');
-  if (!j.error) document.getElementById('fwDelete').value='';
   refreshFirewall();
 }
 

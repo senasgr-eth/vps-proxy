@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -22,6 +24,9 @@ import (
 	"syscall"
 	"time"
 )
+
+//go:embed admin.html
+var adminUI embed.FS
 
 type Group struct {
 	Name         string   `json:"name"`
@@ -37,6 +42,8 @@ type Config struct {
 	SecretToken    string  `json:"secret_token"`
 	TLSCert        string  `json:"tls_cert"`
 	TLSKey         string  `json:"tls_key"`
+	AdminListen    string  `json:"admin_listen"`
+	AdminToken     string  `json:"admin_token"`
 	Groups         []Group `json:"groups"`
 	MaxConnections int     `json:"max_connections"`
 }
@@ -330,6 +337,48 @@ func main() {
 	safeGo("tunnelAcceptLoop", func() {
 		runTunnelAcceptLoop(ctx, tunnelListener, tm, cm)
 	})
+
+	// Start admin HTTP server
+	if cfg.AdminListen != "" {
+		adminMux := http.NewServeMux()
+		adminMux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+			handleAdminAPI(w, r, cm, tm)
+		})
+		adminMux.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
+			handleAdminAPI(w, r, cm, tm)
+		})
+		adminMux.HandleFunc("/api/groups/", func(w http.ResponseWriter, r *http.Request) {
+			handleAdminAPI(w, r, cm, tm)
+		})
+		adminMux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+			handleAdminAPI(w, r, cm, tm)
+		})
+		adminMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			content, _ := adminUI.ReadFile("admin.html")
+			w.Header().Set("Content-Type", "text/html")
+			w.Write(content)
+		})
+
+		adminServer := &http.Server{
+			Addr:    cfg.AdminListen,
+			Handler: adminAuthMiddleware(cfg.AdminToken, adminMux),
+		}
+
+		safeGo("adminServer", func() {
+			log.Printf("Admin UI listening on http://%s", cfg.AdminListen)
+			if err := adminServer.ListenAndServe(); err != http.ErrServerClosed {
+				log.Printf("Admin server error: %v", err)
+			}
+		})
+
+		// Graceful shutdown
+		safeGo("adminShutdown", func() {
+			<-ctx.Done()
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer shutdownCancel()
+			_ = adminServer.Shutdown(shutdownCtx)
+		})
+	}
 
 	// Block main thread until context is done (graceful shutdown)
 	<-ctx.Done()
@@ -1117,4 +1166,164 @@ func routeByProtocol(clientAddr string, clientConn net.Conn, cm *ConfigManager, 
 	log.Printf("[%s] Connection closed. Group: %s | Duration: %s | Bytes Sent: %d | Bytes Rcvd: %d",
 		clientAddr, matchedGroup.Name, duration.Truncate(time.Second),
 		atomic.LoadInt64(&bytesSent), atomic.LoadInt64(&bytesReceived))
+}
+
+// --- Admin HTTP API ---
+
+func adminAuthMiddleware(token string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		cookie, _ := r.Cookie("admin_token")
+		cookieOK := cookie != nil && subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(token)) == 1
+		headerOK := strings.HasPrefix(auth, "Bearer ") && subtle.ConstantTimeCompare([]byte(auth[7:]), []byte(token)) == 1
+
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			if !headerOK && !cookieOK {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"error":"unauthorized"}`))
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func handleAdminAPI(w http.ResponseWriter, r *http.Request, cm *ConfigManager, tm *TunnelManager) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/api/")
+
+	switch {
+	case path == "status" && r.Method == "GET":
+		handleStatus(w, cm, tm)
+	case path == "config" && r.Method == "GET":
+		handleGetConfig(w, cm)
+	case path == "groups" && r.Method == "GET":
+		handleListGroups(w, cm)
+	case path == "groups" && r.Method == "POST":
+		handleAddGroup(w, r, cm)
+	case strings.HasPrefix(path, "groups/") && r.Method == "PUT":
+		name := strings.TrimPrefix(path, "groups/")
+		handleUpdateGroup(w, r, cm, name)
+	case strings.HasPrefix(path, "groups/") && r.Method == "DELETE":
+		name := strings.TrimPrefix(path, "groups/")
+		handleDeleteGroup(w, cm, name)
+	default:
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":"not found"}`))
+	}
+}
+
+type StatusResponse struct {
+	Version      string            `json:"version"`
+	ActiveConns  int64             `json:"active_connections"`
+	MaxConns     int              `json:"max_connections"`
+	TunnelCounts map[string]int    `json:"tunnel_counts"`
+}
+
+func handleStatus(w http.ResponseWriter, cm *ConfigManager, tm *TunnelManager) {
+	cfg := cm.Get()
+	tm.mu.Lock()
+	counts := make(map[string]int)
+	for g, tunnels := range tm.tunnels {
+		counts[g] = len(tunnels)
+	}
+	tm.mu.Unlock()
+
+	json.NewEncoder(w).Encode(StatusResponse{
+		Version:      Version,
+		ActiveConns:  atomic.LoadInt64(&activeConns),
+		MaxConns:     cfg.MaxConnections,
+		TunnelCounts: counts,
+	})
+}
+
+func handleGetConfig(w http.ResponseWriter, cm *ConfigManager) {
+	json.NewEncoder(w).Encode(cm.Get())
+}
+
+func handleListGroups(w http.ResponseWriter, cm *ConfigManager) {
+	json.NewEncoder(w).Encode(cm.Get().Groups)
+}
+
+func handleAddGroup(w http.ResponseWriter, r *http.Request, cm *ConfigManager) {
+	var g Group
+	if err := json.NewDecoder(r.Body).Decode(&g); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid JSON"}`))
+		return
+	}
+	if g.Name == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"name is required"}`))
+		return
+	}
+
+	cm.mu.Lock()
+	cfg := cm.cfg
+	for _, existing := range cfg.Groups {
+		if existing.Name == g.Name {
+			cm.mu.Unlock()
+			w.WriteHeader(http.StatusConflict)
+			w.Write([]byte(`{"error":"group name already exists"}`))
+			return
+		}
+	}
+	cfg.Groups = append(cfg.Groups, g)
+	cm.mu.Unlock()
+
+	log.Printf("[Admin] Group %s added", g.Name)
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(g)
+}
+
+func handleUpdateGroup(w http.ResponseWriter, r *http.Request, cm *ConfigManager, name string) {
+	var g Group
+	if err := json.NewDecoder(r.Body).Decode(&g); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid JSON"}`))
+		return
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	for i, existing := range cm.cfg.Groups {
+		if existing.Name == name {
+			g.Name = name // preserve name
+			cm.cfg.Groups[i] = g
+			log.Printf("[Admin] Group %s updated", name)
+			json.NewEncoder(w).Encode(g)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNotFound)
+	w.Write([]byte(`{"error":"group not found"}`))
+}
+
+func handleDeleteGroup(w http.ResponseWriter, cm *ConfigManager, name string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	for i, g := range cm.cfg.Groups {
+		if g.Name == name {
+			cm.cfg.Groups = append(cm.cfg.Groups[:i], cm.cfg.Groups[i+1:]...)
+			log.Printf("[Admin] Group %s deleted", name)
+			w.Write([]byte(`{"ok":true}`))
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNotFound)
+	w.Write([]byte(`{"error":"group not found"}`))
 }

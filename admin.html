@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Node Proxy Admin</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:#0f1117;color:#c9d1d9;line-height:1.5}
+.header{background:#161b22;border-bottom:1px solid #30363d;padding:16px 24px;display:flex;justify-content:space-between;align-items:center}
+.header h1{font-size:18px;color:#58a6ff}
+.header .logout{color:#8b949e;cursor:pointer;background:none;border:1px solid #30363d;padding:6px 14px;border-radius:6px;font-size:13px}
+.container{max-width:1100px;margin:0 auto;padding:24px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:24px}
+.stat-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px}
+.stat-card .label{font-size:12px;color:#8b949e;text-transform:uppercase}
+.stat-card .value{font-size:24px;font-weight:600;color:#e6edf3;margin-top:4px}
+.tunnels{margin-bottom:24px}
+.tunnels h2{font-size:16px;margin-bottom:12px;color:#e6edf3}
+.tunnel-list{display:flex;flex-wrap:wrap;gap:8px}
+.tunnel-badge{background:#161b22;border:1px solid #30363d;padding:6px 14px;border-radius:20px;font-size:13px;display:flex;align-items:center;gap:8px}
+.tunnel-badge .count{background:#238636;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.toolbar h2{font-size:16px;color:#e6edf3}
+.btn{background:#238636;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500}
+.btn:hover{background:#2ea043}
+.btn.danger{background:#da3633}
+.btn.danger:hover{background:#f85149}
+.btn.secondary{background:#21262d;border:1px solid #30363d}
+.btn.secondary:hover{background:#30363d}
+table{width:100%;border-collapse:collapse;background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}
+th,td{text-align:left;padding:10px 14px;font-size:13px;border-bottom:1px solid #21262d}
+th{color:#8b949e;font-weight:500;background:#0d1117}
+td{color:#c9d1d9}
+.tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.tag.p2p{background:#1f6feb33;color:#58a6ff}
+.tag.stratum{background:#23863633;color:#3fb950}
+.action-btn{background:none;border:none;color:#8b949e;cursor:pointer;padding:4px 8px;font-size:12px;border-radius:4px}
+.action-btn:hover{color:#e6edf3;background:#21262d}
+.action-btn.delete:hover{color:#f85149}
+
+.modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:100;align-items:center;justify-content:center}
+.modal.active{display:flex}
+.modal-content{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:90%;max-width:520px;max-height:90vh;overflow-y:auto}
+.modal h2{font-size:16px;margin-bottom:16px;color:#e6edf3}
+.form-group{margin-bottom:14px}
+.form-group label{display:block;font-size:12px;color:#8b949e;margin-bottom:4px;text-transform:uppercase}
+.form-group input,.form-group select{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 12px;color:#c9d1d9;font-size:13px}
+.form-group input:focus{border-color:#58a6ff;outline:none}
+.form-group textarea{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 12px;color:#c9d1d9;font-size:13px;font-family:monospace;min-height:80px;resize:vertical}
+.form-group textarea:focus{border-color:#58a6ff;outline:none}
+.form-row{display:flex;gap:12px}
+.form-row .btn{flex:1}
+.login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;width:90%;max-width:360px;text-align:center}
+.login-box h2{margin-bottom:20px;color:#e6edf3}
+.login-box input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 14px;color:#c9d1d9;font-size:14px;margin-bottom:12px;text-align:center}
+.login-box button{width:100%;padding:10px}
+.toast{position:fixed;bottom:20px;right:20px;background:#238636;color:#fff;padding:12px 20px;border-radius:8px;font-size:13px;z-index:200;opacity:0;transition:opacity .3s}
+.toast.show{opacity:1}
+.empty{text-align:center;color:#8b949e;padding:48px;font-size:14px}
+</style>
+</head>
+<body>
+
+<div id="login" class="modal active">
+  <div class="login-box">
+    <h2>Node Proxy Admin</h2>
+    <input type="password" id="token-input" placeholder="Admin Token">
+    <button class="btn" onclick="login()">Login</button>
+  </div>
+</div>
+
+<div id="app" style="display:none">
+<div class="header">
+  <h1>Node Proxy Admin <span style="font-size:11px;color:#8b949e;font-weight:400" id="version"></span></h1>
+  <button class="logout" onclick="logout()">Logout</button>
+</div>
+
+<div class="container">
+  <div class="stats">
+    <div class="stat-card"><div class="label">Active Connections</div><div class="value" id="activeConns">-</div></div>
+    <div class="stat-card"><div class="label">Max Connections</div><div class="value" id="maxConns">-</div></div>
+    <div class="stat-card"><div class="label">Total Tunnels</div><div class="value" id="totalTunnels">-</div></div>
+    <div class="stat-card"><div class="label">Groups</div><div class="value" id="groupCount">-</div></div>
+  </div>
+
+  <div class="tunnels">
+    <h2>Tunnel Status</h2>
+    <div class="tunnel-list" id="tunnelList"></div>
+  </div>
+
+  <div class="toolbar">
+    <h2>Groups</h2>
+    <button class="btn" onclick="openAddModal()">+ Add Group</button>
+  </div>
+  <table id="groupTable">
+    <thead><tr><th>Name</th><th>Listen</th><th>Type</th><th>Tunnels</th><th>Coins / Magic</th><th></th></tr></thead>
+    <tbody id="groupBody"></tbody>
+  </table>
+</div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="modal" id="groupModal">
+  <div class="modal-content">
+    <h2 id="modalTitle">Add Group</h2>
+    <div class="form-group"><label>Group Name</label><input id="eName" placeholder="e.g. wojak, stratum_scrypt"></div>
+    <div class="form-group"><label>Listen Address</label><input id="eListen" placeholder="0.0.0.0:PORT (empty = use global port)"></div>
+    <div class="form-group"><label>Type</label><select id="eType" onchange="toggleTypeFields()"><option value="p2p">P2P (magic bytes)</option><option value="stratum">Stratum (coin symbols)</option></select></div>
+    <div class="form-group" id="magicField"><label>Magic Bytes (hex, one per line)</label><textarea id="eMagic" placeholder="6f8da579"></textarea></div>
+    <div class="form-group" id="versionField"><label>Version Proto (for collision resolution, 0=any)</label><input id="eVersion" type="number" value="0" placeholder="e.g. 70015"></div>
+    <div class="form-group" id="coinsField" style="display:none"><label>Coin Symbols (one per line)</label><textarea id="eCoins" placeholder="WOJAK&#10;JKC&#10;LNC"></textarea></div>
+    <div class="form-row">
+      <button class="btn secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn" id="saveBtn" onclick="saveGroup()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let token = localStorage.getItem('admin_token') || '';
+
+function api(path, opts={}) {
+  return fetch('/api/'+path, {...opts, headers:{'Content-Type':'application/json','Authorization':'Bearer '+token,...(opts.headers||{})}}).then(r=>r.json());
+}
+
+async function login() {
+  token = document.getElementById('token-input').value;
+  localStorage.setItem('admin_token', token);
+  try {
+    let r = await api('status');
+    if (r.error) throw r.error;
+    document.getElementById('login').classList.remove('active');
+    document.getElementById('app').style.display = 'block';
+    refresh();
+    setInterval(refresh, 5000);
+  } catch(e) {
+    toast('Invalid token');
+  }
+}
+
+function logout() {
+  localStorage.removeItem('admin_token');
+  token = '';
+  document.getElementById('login').classList.add('active');
+  document.getElementById('app').style.display = 'none';
+}
+
+async function refresh() {
+  try {
+    let s = await api('status');
+    document.getElementById('version').textContent = 'v'+s.version;
+    document.getElementById('activeConns').textContent = s.active_connections;
+    document.getElementById('maxConns').textContent = s.max_connections;
+    let total = Object.values(s.tunnel_counts||{}).reduce((a,b)=>a+b,0);
+    document.getElementById('totalTunnels').textContent = total;
+
+    let tl = document.getElementById('tunnelList');
+    tl.innerHTML = Object.entries(s.tunnel_counts||{}).map(([g,c])=>`<div class="tunnel-badge">${g}<span class="count">${c}</span></div>`).join('')||'<span class="empty">No tunnels</span>';
+
+    let groups = await api('groups');
+    document.getElementById('groupCount').textContent = groups.length;
+    let tb = document.getElementById('groupBody');
+    if (!groups.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">No groups configured</td></tr>'; return; }
+    tb.innerHTML = groups.map((g,i)=>{
+      let type = g.magic_bytes?.length ? 'p2p' : 'stratum';
+      let coins = g.magic_bytes?.join(', ') || g.coins?.join(', ') || '-';
+      return `<tr>
+        <td><strong>${g.name}</strong></td>
+        <td>${g.listen||'<span style="color:#8b949e">global</span>'}</td>
+        <td><span class="tag ${type}">${type.toUpperCase()}</span></td>
+        <td>${s.tunnel_counts?.[g.name]??0}</td>
+        <td style="font-size:11px;font-family:monospace;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${coins}</td>
+        <td>
+          <button class="action-btn" onclick="openEditModal(${i})">Edit</button>
+          <button class="action-btn delete" onclick="deleteGroup(${i})">Del</button>
+        </td></tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+
+let editIndex = -1;
+let groups = [];
+
+function openAddModal() {
+  editIndex = -1;
+  document.getElementById('modalTitle').textContent = 'Add Group';
+  document.getElementById('eName').value = '';
+  document.getElementById('eListen').value = '';
+  document.getElementById('eType').value = 'p2p';
+  document.getElementById('eMagic').value = '';
+  document.getElementById('eVersion').value = '0';
+  document.getElementById('eCoins').value = '';
+  toggleTypeFields();
+  document.getElementById('groupModal').classList.add('active');
+}
+
+async function openEditModal(i) {
+  groups = await api('groups');
+  let g = groups[i];
+  editIndex = i;
+  document.getElementById('modalTitle').textContent = 'Edit Group';
+  document.getElementById('eName').value = g.name;
+  document.getElementById('eListen').value = g.listen||'';
+  if (g.magic_bytes?.length) {
+    document.getElementById('eType').value = 'p2p';
+    document.getElementById('eMagic').value = g.magic_bytes.join('\n');
+    document.getElementById('eVersion').value = g.version_proto||0;
+    document.getElementById('eCoins').value = '';
+  } else {
+    document.getElementById('eType').value = 'stratum';
+    document.getElementById('eMagic').value = '';
+    document.getElementById('eVersion').value = '0';
+    document.getElementById('eCoins').value = (g.coins||[]).join('\n');
+  }
+  toggleTypeFields();
+  document.getElementById('groupModal').classList.add('active');
+}
+
+async function saveGroup() {
+  let type = document.getElementById('eType').value;
+  let g = {
+    name: document.getElementById('eName').value,
+    listen: document.getElementById('eListen').value||undefined,
+  };
+  if (type === 'p2p') {
+    g.magic_bytes = document.getElementById('eMagic').value.split('\n').map(s=>s.trim()).filter(Boolean);
+    g.version_proto = parseInt(document.getElementById('eVersion').value)||0;
+  } else {
+    g.coins = document.getElementById('eCoins').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  }
+  try {
+    if (editIndex >= 0) {
+      let old = groups[editIndex];
+      await fetch('/api/groups/'+old.name, {method:'PUT',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify(g)});
+      toast('Group updated');
+    } else {
+      await fetch('/api/groups', {method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify(g)});
+      toast('Group added');
+    }
+    closeModal();
+    refresh();
+  } catch(e) { toast('Error: '+e.message); }
+}
+
+async function deleteGroup(i) {
+  if (!confirm('Delete this group?')) return;
+  groups = await api('groups');
+  let g = groups[i];
+  await fetch('/api/groups/'+g.name, {method:'DELETE',headers:{'Authorization':'Bearer '+token}});
+  toast('Group deleted');
+  refresh();
+}
+
+function toggleTypeFields() {
+  let t = document.getElementById('eType').value;
+  document.getElementById('magicField').style.display = t==='p2p'?'':'none';
+  document.getElementById('versionField').style.display = t==='p2p'?'':'none';
+  document.getElementById('coinsField').style.display = t==='stratum'?'':'none';
+}
+
+function closeModal() { document.getElementById('groupModal').classList.remove('active'); }
+
+function toast(msg) {
+  let t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 2000);
+}
+
+if (token) {
+  api('status').then(s=>{
+    if (!s.error) { document.getElementById('login').classList.remove('active'); document.getElementById('app').style.display='block'; refresh(); setInterval(refresh,5000); }
+  }).catch(()=>{});
+}
+</script>
+</body>
+</html>
